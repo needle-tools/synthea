@@ -358,6 +358,40 @@ public abstract class Exporter {
       }
       FhirGroupExporterR4.addPatient((String) person.attributes.get(Person.ID));
     }
+    if (Config.getAsBoolean("exporter.fhir.history_export", false)) {
+      // Sequential transaction bundle export for appointment lifecycle replay
+      List<FhirR4.HistoryEvent> events = FhirR4.convertToFHIRHistory(person, stopTime);
+      if (events.size() > 1) { // Only export if there are actual history events beyond initial
+        String patientFolder =
+            person.attributes.getOrDefault(Person.NAME, "Unknown").toString()
+                .replace(' ', '_')
+            + "_" + person.attributes.get(Person.ID);
+        File historyDir = getOutputFolder("fhir_history", person).toPath()
+            .resolve(patientFolder).toFile();
+        historyDir.mkdirs();
+
+        IParser histParser = FhirR4.getContext().newJsonParser().setPrettyPrint(true);
+        java.text.SimpleDateFormat tsFormat =
+            new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH-mm-ss'Z'");
+
+        for (FhirR4.HistoryEvent event : events) {
+          String eventFilename = String.format("%03d_%s_%s.json",
+              event.sequenceIndex,
+              tsFormat.format(new java.util.Date(event.timestamp)),
+              event.label);
+          Path eventPath = historyDir.toPath().resolve(eventFilename);
+          String eventJson = histParser.encodeResourceToString(event.bundle);
+          writeNewFile(eventPath, eventJson);
+        }
+
+        // Write manifest
+        org.hl7.fhir.r4.model.Bundle manifest =
+            FhirR4.createHistoryManifest(events, person);
+        Path manifestPath = historyDir.toPath().resolve("manifest.json");
+        String manifestJson = histParser.encodeResourceToString(manifest);
+        writeNewFile(manifestPath, manifestJson);
+      }
+    }
     if (Config.getAsBoolean("exporter.ccda.export")) {
       String ccdaXml = CCDAExporter.export(person, stopTime);
       File outDirectory = getOutputFolder("ccda", person);

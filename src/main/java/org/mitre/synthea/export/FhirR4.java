@@ -34,10 +34,12 @@ import org.hl7.fhir.r4.model.Appointment;
 import org.hl7.fhir.r4.model.Appointment.AppointmentParticipantComponent;
 import org.hl7.fhir.r4.model.Appointment.AppointmentStatus;
 import org.hl7.fhir.r4.model.Appointment.ParticipationStatus;
+import org.hl7.fhir.r4.model.Basic;
 import org.hl7.fhir.r4.model.BooleanType;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Bundle.BundleEntryComponent;
 import org.hl7.fhir.r4.model.Bundle.BundleEntryRequestComponent;
+import org.hl7.fhir.r4.model.Bundle.BundleEntryResponseComponent;
 import org.hl7.fhir.r4.model.Bundle.BundleType;
 import org.hl7.fhir.r4.model.Bundle.HTTPVerb;
 import org.hl7.fhir.r4.model.CarePlan.CarePlanActivityComponent;
@@ -94,6 +96,7 @@ import org.hl7.fhir.r4.model.ImagingStudy.ImagingStudySeriesInstanceComponent;
 import org.hl7.fhir.r4.model.ImagingStudy.ImagingStudyStatus;
 import org.hl7.fhir.r4.model.Immunization.ImmunizationStatus;
 import org.hl7.fhir.r4.model.Immunization;
+import org.hl7.fhir.r4.model.InstantType;
 import org.hl7.fhir.r4.model.IntegerType;
 import org.hl7.fhir.r4.model.Location.LocationPositionComponent;
 import org.hl7.fhir.r4.model.Location.LocationStatus;
@@ -197,6 +200,9 @@ public class FhirR4 {
 
   protected static boolean TRANSACTION_BUNDLE =
       Config.getAsBoolean("exporter.fhir.transaction_bundle");
+
+  protected static boolean HISTORY_EXPORT =
+      Config.getAsBoolean("exporter.fhir.history_export", false);
 
   protected static boolean USE_US_CORE_IG =
       Config.getAsBoolean("exporter.fhir.use_us_core_ig");
@@ -601,6 +607,521 @@ public class FhirR4 {
         .encodeResourceToString(bundle);
 
     return bundleJson;
+  }
+
+  // ====== History Export: Sequential Transaction Bundles for Simulation Replay ======
+
+  /**
+   * A single event in the appointment lifecycle history, representing one transaction
+   * bundle with a timestamp and descriptive label.
+   */
+  public static class HistoryEvent implements Comparable<HistoryEvent> {
+    /** Timestamp of this event (millis since epoch). */
+    public final long timestamp;
+    /** The transaction bundle for this event. */
+    public final Bundle bundle;
+    /** Human-readable label for this event (e.g., "appointment-booked"). */
+    public final String label;
+    /** Sequence index (0-based), set during export. */
+    public int sequenceIndex;
+
+    public HistoryEvent(long timestamp, Bundle bundle, String label) {
+      this.timestamp = timestamp;
+      this.bundle = bundle;
+      this.label = label;
+    }
+
+    @Override
+    public int compareTo(HistoryEvent other) {
+      return Long.compare(this.timestamp, other.timestamp);
+    }
+  }
+
+  /**
+   * Generate sequential transaction bundles showing the full appointment lifecycle history
+   * for a patient. Each bundle is a valid FHIR transaction that can be POSTed to a server
+   * in order to replay the patient's scheduling journey.
+   *
+   * <p>The history includes:
+   * <ul>
+   *   <li>Bundle 000: Initial patient + organization + practitioner resources (POST)</li>
+   *   <li>Bundle 001+: Per-encounter scheduling events:
+   *     <ul>
+   *       <li>Appointment proposed/booked (POST)</li>
+   *       <li>Appointment status change to fulfilled/noshow/cancelled (PUT + Provenance)</li>
+   *       <li>For cancelled: rescheduled appointment creation</li>
+   *     </ul>
+   *   </li>
+   * </ul>
+   *
+   * @param person   Person to generate history for
+   * @param stopTime Time the simulation ended
+   * @return Ordered list of HistoryEvents, each containing a transaction bundle
+   */
+  public static List<HistoryEvent> convertToFHIRHistory(Person person, long stopTime) {
+    List<HistoryEvent> events = new ArrayList<>();
+
+    // ---- Event 0: Initial patient setup (all non-scheduling resources) ----
+    Bundle mainBundle = convertToFHIR(person, stopTime);
+    // The main bundle already has everything including final-state appointments.
+    // We keep it as the "initial" bundle for non-scheduling resources.
+    long earliestEncounter = Long.MAX_VALUE;
+    for (Encounter enc : person.record.encounters) {
+      if (enc.start < earliestEncounter) {
+        earliestEncounter = enc.start;
+      }
+    }
+    long initialTime = earliestEncounter != Long.MAX_VALUE
+        ? earliestEncounter - 30L * 24 * 60 * 60 * 1000 // 30 days before first encounter
+        : stopTime;
+
+    events.add(new HistoryEvent(initialTime, mainBundle, "initial"));
+
+    // ---- Generate per-encounter appointment lifecycle events ----
+    // We need to reconstruct the appointment lifecycle for each encounter.
+    // The main bundle already has final-state appointments, but for history
+    // we need intermediate states (booked → arrived → fulfilled/noshow/cancelled).
+
+    BundleEntryComponent personEntry = mainBundle.getEntry().get(0); // Patient is always first
+
+    for (Encounter encounter : person.record.encounters) {
+      if (isUnscheduledEncounter(encounter)) {
+        continue;
+      }
+      if (!shouldExport(Appointment.class) || !shouldExport(Slot.class)) {
+        continue;
+      }
+
+      // Find the appointment ID deterministically (same as in appointment() method)
+      String apptId = UUID.nameUUIDFromBytes(
+          ("appointment-" + encounter.uuid.toString()).getBytes()).toString();
+      String apptFullUrl = getUrlPrefix("Appointment") + apptId;
+
+      // Determine the lifecycle outcome (must use same RNG seed as original export)
+      // We use encounter-specific deterministic values
+      double roll = deterministicRandom(encounter.uuid.toString(), "appt-lifecycle");
+      AppointmentStatus finalStatus;
+      String cancelReason = null;
+      boolean createRescheduled = false;
+
+      if (roll < APPT_PROB_FULFILLED) {
+        finalStatus = AppointmentStatus.FULFILLED;
+      } else if (roll < APPT_PROB_CANCELLED) {
+        finalStatus = AppointmentStatus.CANCELLED;
+        cancelReason = deterministicRandom(encounter.uuid.toString(), "cancel-reason")
+            < 0.6 ? "pat" : "prov";
+        createRescheduled = true;
+      } else if (roll < APPT_PROB_NOSHOW) {
+        finalStatus = AppointmentStatus.NOSHOW;
+      } else if (roll < APPT_PROB_BOOKED) {
+        finalStatus = AppointmentStatus.BOOKED;
+      } else {
+        finalStatus = AppointmentStatus.WAITLIST;
+      }
+
+      // Calculate lifecycle timestamps
+      long bookingLeadMs = (1 + Math.abs(encounter.uuid.hashCode() % 30))
+          * 24L * 60 * 60 * 1000;
+      long bookedTime = encounter.start - bookingLeadMs;
+      long arrivedTime = encounter.start;
+      long completedTime = encounter.stop > 0 ? encounter.stop : encounter.start + 3600000;
+
+      // Clinician references for Provenance
+      String clinicianRef = null;
+      if (encounter.clinician != null) {
+        clinicianRef = getUrlPrefix("Practitioner")
+            + encounter.clinician.getResourceID();
+      }
+
+      // ---- Lifecycle Event 1: Appointment BOOKED ----
+      Bundle bookedBundle = createHistoryTransactionBundle();
+      bookedBundle.setTimestamp(new Date(bookedTime));
+      {
+        Appointment bookedAppt = new Appointment();
+        bookedAppt.setId(apptId);
+        bookedAppt.setStatus(AppointmentStatus.BOOKED);
+        bookedAppt.addServiceType(encounterServiceType(encounter));
+        bookedAppt.setStart(new Date(encounter.start));
+        bookedAppt.setEnd(new Date(encounter.stop));
+        long durationMin = (encounter.stop - encounter.start) / (60 * 1000);
+        bookedAppt.setMinutesDuration((int) Math.max(durationMin, 1));
+        bookedAppt.setCreated(new Date(bookedTime));
+        bookedAppt.setPriority(5);
+
+        // Patient participant
+        AppointmentParticipantComponent patPart = bookedAppt.addParticipant();
+        patPart.setActor(new Reference(personEntry.getFullUrl()));
+        patPart.addType(mapCodeToCodeableConcept(
+            new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                "SBJ", "subject"), null));
+        patPart.setStatus(ParticipationStatus.NEEDSACTION);
+
+        // Clinician participant
+        if (clinicianRef != null) {
+          AppointmentParticipantComponent clinPart = bookedAppt.addParticipant();
+          clinPart.setActor(new Reference(clinicianRef));
+          clinPart.addType(mapCodeToCodeableConcept(
+              new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                  "PPRF", "primary performer"), null));
+          clinPart.setStatus(ParticipationStatus.ACCEPTED);
+        }
+
+        // Set meta.versionId for history tracking
+        Meta meta = new Meta();
+        meta.setVersionId("1");
+        meta.setLastUpdated(new Date(bookedTime));
+        bookedAppt.setMeta(meta);
+
+        addHistoryEntry(bookedBundle, bookedAppt, apptId, HTTPVerb.POST);
+
+        // Provenance for creation
+        addHistoryProvenance(bookedBundle, apptFullUrl, bookedTime,
+            "CREATE", clinicianRef, "Appointment booked");
+      }
+      events.add(new HistoryEvent(bookedTime, bookedBundle, "appointment-booked"));
+
+      // ---- Lifecycle Event 2: Status change (depends on outcome) ----
+      if (finalStatus == AppointmentStatus.FULFILLED) {
+        // 2a: Patient arrives
+        Bundle arrivedBundle = createHistoryTransactionBundle();
+        arrivedBundle.setTimestamp(new Date(arrivedTime));
+        {
+          Appointment arrivedAppt = new Appointment();
+          arrivedAppt.setId(apptId);
+          arrivedAppt.setStatus(AppointmentStatus.ARRIVED);
+          arrivedAppt.addServiceType(encounterServiceType(encounter));
+          arrivedAppt.setStart(new Date(encounter.start));
+          arrivedAppt.setEnd(new Date(encounter.stop));
+          arrivedAppt.setCreated(new Date(bookedTime));
+
+          AppointmentParticipantComponent patPart = arrivedAppt.addParticipant();
+          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.addType(mapCodeToCodeableConcept(
+              new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                  "SBJ", "subject"), null));
+          patPart.setStatus(ParticipationStatus.ACCEPTED);
+
+          Meta meta = new Meta();
+          meta.setVersionId("2");
+          meta.setLastUpdated(new Date(arrivedTime));
+          arrivedAppt.setMeta(meta);
+
+          addHistoryEntry(arrivedBundle, arrivedAppt, apptId, HTTPVerb.PUT);
+          addHistoryProvenance(arrivedBundle, apptFullUrl, arrivedTime,
+              "UPDATE", clinicianRef, "Patient arrived");
+        }
+        events.add(new HistoryEvent(arrivedTime, arrivedBundle, "patient-arrived"));
+
+        // 2b: Appointment fulfilled
+        Bundle fulfilledBundle = createHistoryTransactionBundle();
+        fulfilledBundle.setTimestamp(new Date(completedTime));
+        {
+          Appointment fulfilledAppt = new Appointment();
+          fulfilledAppt.setId(apptId);
+          fulfilledAppt.setStatus(AppointmentStatus.FULFILLED);
+          fulfilledAppt.addServiceType(encounterServiceType(encounter));
+          fulfilledAppt.setStart(new Date(encounter.start));
+          fulfilledAppt.setEnd(new Date(encounter.stop));
+          fulfilledAppt.setCreated(new Date(bookedTime));
+
+          AppointmentParticipantComponent patPart = fulfilledAppt.addParticipant();
+          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.addType(mapCodeToCodeableConcept(
+              new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                  "SBJ", "subject"), null));
+          patPart.setStatus(ParticipationStatus.ACCEPTED);
+
+          Meta meta = new Meta();
+          meta.setVersionId("3");
+          meta.setLastUpdated(new Date(completedTime));
+          fulfilledAppt.setMeta(meta);
+
+          addHistoryEntry(fulfilledBundle, fulfilledAppt, apptId, HTTPVerb.PUT);
+          addHistoryProvenance(fulfilledBundle, apptFullUrl, completedTime,
+              "UPDATE", clinicianRef, "Appointment fulfilled");
+        }
+        events.add(new HistoryEvent(completedTime, fulfilledBundle,
+            "appointment-fulfilled"));
+
+      } else if (finalStatus == AppointmentStatus.NOSHOW) {
+        // Patient no-show at appointment time
+        Bundle noshowBundle = createHistoryTransactionBundle();
+        noshowBundle.setTimestamp(new Date(arrivedTime + 900000)); // 15 min after start
+        {
+          Appointment noshowAppt = new Appointment();
+          noshowAppt.setId(apptId);
+          noshowAppt.setStatus(AppointmentStatus.NOSHOW);
+          noshowAppt.addServiceType(encounterServiceType(encounter));
+          noshowAppt.setStart(new Date(encounter.start));
+          noshowAppt.setEnd(new Date(encounter.stop));
+          noshowAppt.setCreated(new Date(bookedTime));
+
+          AppointmentParticipantComponent patPart = noshowAppt.addParticipant();
+          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.addType(mapCodeToCodeableConcept(
+              new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                  "SBJ", "subject"), null));
+          patPart.setStatus(ParticipationStatus.DECLINED);
+
+          Meta meta = new Meta();
+          meta.setVersionId("2");
+          meta.setLastUpdated(new Date(arrivedTime + 900000));
+          noshowAppt.setMeta(meta);
+
+          addHistoryEntry(noshowBundle, noshowAppt, apptId, HTTPVerb.PUT);
+          addHistoryProvenance(noshowBundle, apptFullUrl, arrivedTime + 900000,
+              "UPDATE", clinicianRef, "Patient did not show up");
+        }
+        events.add(new HistoryEvent(arrivedTime + 900000, noshowBundle,
+            "appointment-noshow"));
+
+      } else if (finalStatus == AppointmentStatus.CANCELLED) {
+        // Cancellation happens some time after booking
+        long cancelTime = bookedTime + (arrivedTime - bookedTime) / 2;
+        Bundle cancelBundle = createHistoryTransactionBundle();
+        cancelBundle.setTimestamp(new Date(cancelTime));
+        {
+          Appointment cancelledAppt = new Appointment();
+          cancelledAppt.setId(apptId);
+          cancelledAppt.setStatus(AppointmentStatus.CANCELLED);
+          cancelledAppt.addServiceType(encounterServiceType(encounter));
+          cancelledAppt.setStart(new Date(encounter.start));
+          cancelledAppt.setEnd(new Date(encounter.stop));
+          cancelledAppt.setCreated(new Date(bookedTime));
+
+          // Cancellation reason
+          String crDisplay = "pat".equals(cancelReason)
+              ? "Patient request" : "Provider request";
+          cancelledAppt.setCancelationReason(
+              mapCodeToCodeableConcept(
+                  new Code(CANCEL_REASON_SYSTEM, cancelReason, crDisplay),
+                  CANCEL_REASON_SYSTEM));
+
+          AppointmentParticipantComponent patPart = cancelledAppt.addParticipant();
+          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.addType(mapCodeToCodeableConcept(
+              new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                  "SBJ", "subject"), null));
+          patPart.setStatus(ParticipationStatus.DECLINED);
+
+          Meta meta = new Meta();
+          meta.setVersionId("2");
+          meta.setLastUpdated(new Date(cancelTime));
+          cancelledAppt.setMeta(meta);
+
+          addHistoryEntry(cancelBundle, cancelledAppt, apptId, HTTPVerb.PUT);
+          addHistoryProvenance(cancelBundle, apptFullUrl, cancelTime,
+              "UPDATE", clinicianRef,
+              "Appointment cancelled: " + crDisplay);
+        }
+        events.add(new HistoryEvent(cancelTime, cancelBundle,
+            "appointment-cancelled"));
+
+        // Rescheduled appointment
+        if (createRescheduled) {
+          long rescheduleDelayMs = (1 + Math.abs(
+              (encounter.uuid.hashCode() * 31) % 14)) * 24L * 60 * 60 * 1000;
+          long rescheduledTime = encounter.start + rescheduleDelayMs;
+          String reschedApptId = UUID.nameUUIDFromBytes(
+              ("appointment-rescheduled-" + encounter.uuid.toString()).getBytes()).toString();
+          String reschedFullUrl = getUrlPrefix("Appointment") + reschedApptId;
+
+          Bundle reschedBundle = createHistoryTransactionBundle();
+          reschedBundle.setTimestamp(new Date(cancelTime + 3600000)); // 1hr after cancel
+          {
+            Appointment reschedAppt = new Appointment();
+            reschedAppt.setId(reschedApptId);
+            reschedAppt.setStatus(AppointmentStatus.BOOKED);
+            reschedAppt.addServiceType(encounterServiceType(encounter));
+            reschedAppt.setStart(new Date(rescheduledTime));
+            reschedAppt.setEnd(new Date(rescheduledTime
+                + (encounter.stop - encounter.start)));
+            reschedAppt.setCreated(new Date(cancelTime + 3600000));
+            reschedAppt.setPriority(5);
+
+            AppointmentParticipantComponent patPart = reschedAppt.addParticipant();
+            patPart.setActor(new Reference(personEntry.getFullUrl()));
+            patPart.addType(mapCodeToCodeableConcept(
+                new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+                    "SBJ", "subject"), null));
+            patPart.setStatus(ParticipationStatus.ACCEPTED);
+
+            Meta meta = new Meta();
+            meta.setVersionId("1");
+            meta.setLastUpdated(new Date(cancelTime + 3600000));
+            reschedAppt.setMeta(meta);
+
+            addHistoryEntry(reschedBundle, reschedAppt, reschedApptId, HTTPVerb.POST);
+            addHistoryProvenance(reschedBundle, reschedFullUrl, cancelTime + 3600000,
+                "CREATE", clinicianRef,
+                "Rescheduled appointment after cancellation");
+          }
+          events.add(new HistoryEvent(cancelTime + 3600000, reschedBundle,
+              "appointment-rescheduled"));
+        }
+      }
+      // For BOOKED and WAITLIST, no further status changes (still pending)
+    }
+
+    // Sort all events chronologically and assign sequence indices
+    Collections.sort(events);
+    for (int i = 0; i < events.size(); i++) {
+      events.get(i).sequenceIndex = i;
+    }
+
+    return events;
+  }
+
+  /**
+   * Generate a manifest Bundle (type=collection) that indexes all history event bundles
+   * for a patient. This can be used by consumers to understand the playback sequence.
+   *
+   * @param events  The ordered list of history events
+   * @param person  The patient
+   * @return A manifest Bundle
+   */
+  public static Bundle createHistoryManifest(List<HistoryEvent> events, Person person) {
+    Bundle manifest = new Bundle();
+    manifest.setType(BundleType.COLLECTION);
+    manifest.setTimestamp(new Date());
+
+    manifest.setIdentifier(new Identifier()
+        .setSystem(SYNTHEA_IDENTIFIER)
+        .setValue("history-" + person.attributes.get(Person.ID)));
+
+    Meta meta = new Meta();
+    meta.addTag()
+        .setSystem(SYNTHEA_EXT + "tags")
+        .setCode("transaction-sequence")
+        .setDisplay("Sequential transaction bundles for patient simulation replay");
+    manifest.setMeta(meta);
+
+    manifest.setTotal(events.size());
+
+    for (HistoryEvent event : events) {
+      String filename = String.format("%03d_%s_%s.json",
+          event.sequenceIndex,
+          new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH-mm-ss'Z'")
+              .format(new Date(event.timestamp)),
+          event.label);
+
+      Basic indexEntry = new Basic();
+      indexEntry.setCode(new CodeableConcept().setText("Transaction sequence manifest entry"));
+      indexEntry.addExtension()
+          .setUrl(SYNTHEA_EXT + "StructureDefinition/sequence-index")
+          .setValue(new IntegerType(event.sequenceIndex));
+      indexEntry.addExtension()
+          .setUrl(SYNTHEA_EXT + "StructureDefinition/event-timestamp")
+          .setValue(new InstantType(new Date(event.timestamp)));
+      indexEntry.addExtension()
+          .setUrl(SYNTHEA_EXT + "StructureDefinition/event-label")
+          .setValue(new StringType(event.label));
+
+      BundleEntryComponent entry = manifest.addEntry();
+      entry.setFullUrl(filename);
+      entry.setResource(indexEntry);
+    }
+
+    return manifest;
+  }
+
+  /**
+   * Create a new empty transaction Bundle for a history event.
+   */
+  private static Bundle createHistoryTransactionBundle() {
+    Bundle bundle = new Bundle();
+    bundle.setType(BundleType.TRANSACTION);
+    return bundle;
+  }
+
+  /**
+   * Add a resource entry to a history transaction bundle with the specified HTTP verb.
+   */
+  private static BundleEntryComponent addHistoryEntry(Bundle bundle, Resource resource,
+      String resourceId, HTTPVerb method) {
+    BundleEntryComponent entry = bundle.addEntry();
+    resource.setId(resourceId);
+    entry.setFullUrl(getUrlPrefix(resource.fhirType()) + resourceId);
+    entry.setResource(resource);
+
+    BundleEntryRequestComponent request = entry.getRequest();
+    request.setMethod(method);
+    String resourceType = resource.getResourceType().name();
+    if (method == HTTPVerb.PUT) {
+      request.setUrl(resourceType + "/" + resourceId);
+    } else {
+      request.setUrl(resourceType);
+    }
+    entry.setRequest(request);
+
+    // Add response metadata for history tracking
+    BundleEntryResponseComponent response = entry.getResponse();
+    if (resource.hasMeta() && resource.getMeta().hasVersionId()) {
+      response.setEtag("W/\"" + resource.getMeta().getVersionId() + "\"");
+      response.setLastModified(resource.getMeta().getLastUpdated());
+    }
+    response.setStatus(method == HTTPVerb.POST ? "201 Created" : "200 OK");
+    entry.setResponse(response);
+
+    return entry;
+  }
+
+  /**
+   * Add a Provenance resource to a history transaction bundle that records
+   * a state change with the specified activity code.
+   *
+   * @param bundle       The transaction bundle to add the Provenance to
+   * @param targetUrl    The full URL of the target resource (e.g., Appointment)
+   * @param recordedTime When this change was recorded
+   * @param activityCode The v3-DataOperation code (CREATE, UPDATE, DELETE)
+   * @param agentRef     Reference to the agent (Practitioner) who performed this
+   * @param description  Human-readable description of the change
+   */
+  private static void addHistoryProvenance(Bundle bundle, String targetUrl,
+      long recordedTime, String activityCode, String agentRef,
+      String description) {
+
+    Provenance prov = new Provenance();
+    prov.addTarget(new Reference(targetUrl));
+    prov.setRecorded(new Date(recordedTime));
+
+    // Activity coding
+    prov.setActivity(new CodeableConcept()
+        .addCoding(new Coding()
+            .setSystem("http://terminology.hl7.org/CodeSystem/v3-DataOperation")
+            .setCode(activityCode)
+            .setDisplay(activityCode.substring(0, 1)
+                + activityCode.substring(1).toLowerCase())));
+
+    // Agent
+    ProvenanceAgentComponent agent = prov.addAgent();
+    agent.setType(mapCodeToCodeableConcept(
+        new Code("http://terminology.hl7.org/CodeSystem/provenance-participant-type",
+            "author", "Author"), null));
+    if (agentRef != null) {
+      agent.setWho(new Reference(agentRef));
+    } else {
+      agent.setWho(new Reference().setDisplay("System"));
+    }
+
+    // Description as text
+    prov.addReason(new CodeableConcept().setText(description));
+
+    String provId = UUID.nameUUIDFromBytes(
+        ("provenance-" + targetUrl + "-" + recordedTime + "-" + activityCode)
+            .getBytes()).toString();
+
+    addHistoryEntry(bundle, prov, provId, HTTPVerb.POST);
+  }
+
+  /**
+   * Generate a deterministic random double (0.0-1.0) from a seed string and salt.
+   * Used instead of Person.rand() for history export to ensure consistent lifecycle
+   * decisions independent of RNG call order.
+   */
+  private static double deterministicRandom(String seed, String salt) {
+    long hash = UUID.nameUUIDFromBytes((seed + salt).getBytes()).getMostSignificantBits();
+    return (double) (hash & 0x7FFFFFFFL) / (double) 0x7FFFFFFFL;
   }
 
   /**
