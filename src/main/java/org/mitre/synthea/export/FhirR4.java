@@ -94,6 +94,10 @@ import org.hl7.fhir.r4.model.Identifier.IdentifierUse;
 import org.hl7.fhir.r4.model.ImagingStudy.ImagingStudySeriesComponent;
 import org.hl7.fhir.r4.model.ImagingStudy.ImagingStudySeriesInstanceComponent;
 import org.hl7.fhir.r4.model.ImagingStudy.ImagingStudyStatus;
+import org.hl7.fhir.r4.model.CommunicationRequest;
+import org.hl7.fhir.r4.model.CommunicationRequest.CommunicationRequestStatus;
+import org.hl7.fhir.r4.model.CommunicationRequest.CommunicationPriority;
+import org.hl7.fhir.r4.model.Encounter.EncounterLocationComponent;
 import org.hl7.fhir.r4.model.Immunization.ImmunizationStatus;
 import org.hl7.fhir.r4.model.Immunization;
 import org.hl7.fhir.r4.model.InstantType;
@@ -427,10 +431,41 @@ public class FhirR4 {
       bundle.setType(BundleType.COLLECTION);
     }
 
+    // Clear location hierarchy cache for each patient
+    clearLocationCache();
+
     BundleEntryComponent personEntry = basicInfo(person, bundle, stopTime);
 
     for (Encounter encounter : person.record.encounters) {
       BundleEntryComponent encounterEntry = encounter(person, personEntry, bundle, encounter);
+
+      // --- Enhanced Location Hierarchy ---
+      // Add department/ward/room/bed locations to the encounter
+      BundleEntryComponent locationEntry = null;
+      if (shouldExport(org.hl7.fhir.r4.model.Location.class)) {
+        Provider provider = encounter.provider;
+        if (provider == null) {
+          provider = person.getProvider(EncounterType.WELLNESS, encounter.start);
+        }
+        locationEntry = encounterLocation(bundle, provider, encounter, person);
+        if (locationEntry != null) {
+          org.hl7.fhir.r4.model.Encounter encounterResource =
+              (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+          EncounterLocationComponent locComp = new EncounterLocationComponent();
+          locComp.setLocation(new Reference(locationEntry.getFullUrl())
+              .setDisplay(((org.hl7.fhir.r4.model.Location)
+                  locationEntry.getResource()).getName()));
+          locComp.setStatus(
+              org.hl7.fhir.r4.model.Encounter.EncounterLocationStatus.ACTIVE);
+          locComp.setPhysicalType(
+              ((org.hl7.fhir.r4.model.Location) locationEntry.getResource())
+                  .getPhysicalType());
+          locComp.setPeriod(new Period()
+              .setStart(new Date(encounter.start))
+              .setEnd(new Date(encounter.stop)));
+          encounterResource.addLocation(locComp);
+        }
+      }
 
       if (shouldExport(Condition.class)) {
         for (HealthRecord.Entry condition : encounter.conditions) {
@@ -477,10 +512,36 @@ public class FhirR4 {
         }
       }
 
+      List<BundleEntryComponent> medReqEntries = new ArrayList<>();
       if (shouldExport(MedicationRequest.class)) {
         for (Medication medication : encounter.medications) {
-          medicationRequest(person, personEntry, bundle, encounterEntry, encounter, medication);
+          BundleEntryComponent medReqEntry = medicationRequest(person, personEntry,
+              bundle, encounterEntry, encounter, medication);
+          medReqEntries.add(medReqEntry);
+
+          // Scheduled individual MedicationAdministration events (nurse medication overview)
+          if (shouldExport(MedicationAdministration.class)) {
+            scheduledMedicationAdministrations(person, personEntry, bundle,
+                encounterEntry, medication, medReqEntry);
+          }
+
+          // CommunicationRequest: medication reminder
+          if (shouldExport(CommunicationRequest.class)) {
+            medicationReminder(personEntry, bundle, medReqEntry, medication, encounter);
+          }
         }
+      }
+
+      // Medication-based CarePlan (schedule overview) for encounters with medications
+      if (!encounter.medications.isEmpty()
+          && shouldExport(org.hl7.fhir.r4.model.CarePlan.class)) {
+        medicationCarePlan(personEntry, bundle, encounterEntry, encounter,
+            encounter.medications);
+      }
+
+      // Nurse handover task board (medications, labs, shift handoff)
+      if (shouldExport(Task.class)) {
+        nurseHandoverTasks(personEntry, bundle, encounterEntry, encounter, medReqEntries);
       }
 
       if (shouldExport(Immunization.class)) {
@@ -548,7 +609,28 @@ public class FhirR4 {
 
       if (shouldExport(Appointment.class) && slotEntry != null
           && !isUnscheduledEncounter(encounter)) {
-        appointment(person, personEntry, bundle, encounterEntry, slotEntry, encounter);
+        BundleEntryComponent apptEntry = appointment(person, personEntry, bundle,
+            encounterEntry, slotEntry, encounter);
+
+        // Add reasonReference to the Appointment linking to Condition
+        if (apptEntry != null && encounter.reason != null) {
+          Appointment apptResource = (Appointment) apptEntry.getResource();
+          BundleEntryComponent condEntry =
+              findConditionResourceByCode(bundle, encounter.reason.code);
+          if (condEntry != null) {
+            apptResource.addReasonReference(new Reference(condEntry.getFullUrl()));
+          }
+        }
+
+        // CommunicationRequest: appointment reminder (not for emergency encounters)
+        if (apptEntry != null && shouldExport(CommunicationRequest.class)
+            && !isUnscheduledEncounter(encounter)) {
+          Appointment apptRes = (Appointment) apptEntry.getResource();
+          if (apptRes.getStatus() != AppointmentStatus.CANCELLED
+              && apptRes.getStatus() != AppointmentStatus.NOSHOW) {
+            appointmentReminder(personEntry, bundle, apptEntry, encounter);
+          }
+        }
       }
 
       if (shouldExport(ServiceRequest.class)) {
@@ -581,6 +663,32 @@ public class FhirR4 {
                 imagingStudy.stop != 0L ? imagingStudy.stop : imagingStudy.start);
           }
         }
+      }
+
+      // ====== Discharge Planning (for inpatient/SNF/hospice encounters) ======
+      EncounterType encType = EncounterType.fromString(encounter.type);
+      if (encType == EncounterType.INPATIENT || encType == EncounterType.SNF
+          || encType == EncounterType.HOSPICE) {
+        BundleEntryComponent dischargeCareTeamEntry = null;
+        if (shouldExport(CareTeam.class)) {
+          dischargeCareTeamEntry = dischargeCareTeam(personEntry, bundle,
+              encounterEntry, encounter);
+        }
+        if (shouldExport(org.hl7.fhir.r4.model.CarePlan.class)) {
+          dischargePlan(personEntry, bundle, encounterEntry, encounter,
+              dischargeCareTeamEntry);
+        }
+
+        if (shouldExport(Task.class) || shouldExport(CommunicationRequest.class)) {
+          dischargeFollowUpWorkflow(personEntry, bundle, encounterEntry, encounter,
+              dischargeCareTeamEntry);
+        }
+      }
+
+      // Tumorboard v1/v2 preparation and post-board follow-up plan
+      if (shouldExport(org.hl7.fhir.r4.model.CarePlan.class)
+          && isTumorBoardCandidate(encounter)) {
+        tumorBoardCarePlans(personEntry, bundle, encounterEntry, encounter);
       }
     }
 
@@ -682,7 +790,7 @@ public class FhirR4 {
     // The main bundle already has final-state appointments, but for history
     // we need intermediate states (booked → arrived → fulfilled/noshow/cancelled).
 
-    BundleEntryComponent personEntry = mainBundle.getEntry().get(0); // Patient is always first
+    String patientHistoryRef = "Patient/" + person.attributes.get(Person.ID);
 
     for (Encounter encounter : person.record.encounters) {
       if (isUnscheduledEncounter(encounter)) {
@@ -729,8 +837,7 @@ public class FhirR4 {
       // Clinician references for Provenance
       String clinicianRef = null;
       if (encounter.clinician != null) {
-        clinicianRef = getUrlPrefix("Practitioner")
-            + encounter.clinician.getResourceID();
+        clinicianRef = ExportHelper.buildFhirNpiSearchUrl(encounter.clinician);
       }
 
       // ---- Lifecycle Event 1: Appointment BOOKED ----
@@ -750,7 +857,7 @@ public class FhirR4 {
 
         // Patient participant
         AppointmentParticipantComponent patPart = bookedAppt.addParticipant();
-        patPart.setActor(new Reference(personEntry.getFullUrl()));
+        patPart.setActor(new Reference(patientHistoryRef));
         patPart.addType(mapCodeToCodeableConcept(
             new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
                 "SBJ", "subject"), null));
@@ -772,7 +879,7 @@ public class FhirR4 {
         meta.setLastUpdated(new Date(bookedTime));
         bookedAppt.setMeta(meta);
 
-        addHistoryEntry(bookedBundle, bookedAppt, apptId, HTTPVerb.POST);
+        addHistoryEntry(bookedBundle, bookedAppt, apptId, HTTPVerb.PUT);
 
         // Provenance for creation
         addHistoryProvenance(bookedBundle, apptFullUrl, bookedTime,
@@ -795,7 +902,7 @@ public class FhirR4 {
           arrivedAppt.setCreated(new Date(bookedTime));
 
           AppointmentParticipantComponent patPart = arrivedAppt.addParticipant();
-          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.setActor(new Reference(patientHistoryRef));
           patPart.addType(mapCodeToCodeableConcept(
               new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
                   "SBJ", "subject"), null));
@@ -825,7 +932,7 @@ public class FhirR4 {
           fulfilledAppt.setCreated(new Date(bookedTime));
 
           AppointmentParticipantComponent patPart = fulfilledAppt.addParticipant();
-          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.setActor(new Reference(patientHistoryRef));
           patPart.addType(mapCodeToCodeableConcept(
               new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
                   "SBJ", "subject"), null));
@@ -857,7 +964,7 @@ public class FhirR4 {
           noshowAppt.setCreated(new Date(bookedTime));
 
           AppointmentParticipantComponent patPart = noshowAppt.addParticipant();
-          patPart.setActor(new Reference(personEntry.getFullUrl()));
+          patPart.setActor(new Reference(patientHistoryRef));
           patPart.addType(mapCodeToCodeableConcept(
               new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
                   "SBJ", "subject"), null));
@@ -898,7 +1005,7 @@ public class FhirR4 {
                   CANCEL_REASON_SYSTEM));
 
           AppointmentParticipantComponent patPart = cancelledAppt.addParticipant();
-          patPart.setActor(new Reference(personEntry.getFullUrl()));
+            patPart.setActor(new Reference(patientHistoryRef));
           patPart.addType(mapCodeToCodeableConcept(
               new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
                   "SBJ", "subject"), null));
@@ -940,7 +1047,7 @@ public class FhirR4 {
             reschedAppt.setPriority(5);
 
             AppointmentParticipantComponent patPart = reschedAppt.addParticipant();
-            patPart.setActor(new Reference(personEntry.getFullUrl()));
+            patPart.setActor(new Reference(patientHistoryRef));
             patPart.addType(mapCodeToCodeableConcept(
                 new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
                     "SBJ", "subject"), null));
@@ -951,7 +1058,7 @@ public class FhirR4 {
             meta.setLastUpdated(new Date(cancelTime + 3600000));
             reschedAppt.setMeta(meta);
 
-            addHistoryEntry(reschedBundle, reschedAppt, reschedApptId, HTTPVerb.POST);
+            addHistoryEntry(reschedBundle, reschedAppt, reschedApptId, HTTPVerb.PUT);
             addHistoryProvenance(reschedBundle, reschedFullUrl, cancelTime + 3600000,
                 "CREATE", clinicianRef,
                 "Rescheduled appointment after cancellation");
@@ -1111,7 +1218,7 @@ public class FhirR4 {
         ("provenance-" + targetUrl + "-" + recordedTime + "-" + activityCode)
             .getBytes()).toString();
 
-    addHistoryEntry(bundle, prov, provId, HTTPVerb.POST);
+    addHistoryEntry(bundle, prov, provId, HTTPVerb.PUT);
   }
 
   /**
@@ -1562,18 +1669,9 @@ public class FhirR4 {
     }
 
     if (encounter.clinician != null) {
-      if (TRANSACTION_BUNDLE) {
-        encounterResource.addParticipant().setIndividual(new Reference(
-                ExportHelper.buildFhirNpiSearchUrl(encounter.clinician)));
-      } else {
-        String practitionerFullUrl = findPractitioner(encounter.clinician, bundle);
-        if (practitionerFullUrl != null) {
-          encounterResource.addParticipant().setIndividual(new Reference(practitionerFullUrl));
-        } else {
-          BundleEntryComponent practitioner = practitioner(bundle, encounter.clinician);
-          encounterResource.addParticipant().setIndividual(
-                  new Reference(practitioner.getFullUrl()));
-        }
+      Reference practitionerRef = clinicianReference(encounter.clinician, bundle);
+      if (practitionerRef != null) {
+        encounterResource.addParticipant().setIndividual(practitionerRef);
       }
       encounterResource.getParticipantFirstRep().getIndividual()
           .setDisplay(encounter.clinician.getFullname());
@@ -1971,11 +2069,10 @@ public class FhirR4 {
         .setDisplay("Primary provider"));
     Reference providerReference = new Reference().setDisplay("Unknown");
     if (encounter.clinician != null) {
-      String practitionerFullUrl = TRANSACTION_BUNDLE
-          ? ExportHelper.buildFhirNpiSearchUrl(encounter.clinician)
-          : findPractitioner(encounter.clinician, bundle);
-      if (practitionerFullUrl != null) {
-        providerReference = new Reference(practitionerFullUrl);
+      Reference practitionerRef = clinicianReference(encounter.clinician, bundle);
+      if (practitionerRef != null && practitionerRef.hasReference()) {
+        providerReference = new Reference(practitionerRef.getReference())
+            .setDisplay(practitionerRef.getDisplay());
       }
     } else if (encounter.provider != null) {
       String providerUrl = TRANSACTION_BUNDLE
@@ -2786,9 +2883,10 @@ public class FhirR4 {
 
     String clinicianDisplay = clinician.getFullname();
 
-    String practitionerFullUrl = TRANSACTION_BUNDLE
-            ? ExportHelper.buildFhirNpiSearchUrl(clinician)
-            : findPractitioner(clinician, bundle);
+    Reference practitionerRef = clinicianReference(clinician, bundle);
+    String practitionerFullUrl = practitionerRef != null
+      ? practitionerRef.getReference()
+      : ExportHelper.buildFhirNpiSearchUrl(clinician);
 
     String organizationFullUrl = TRANSACTION_BUNDLE
             ? ExportHelper.buildFhirSearchUrl("Organization",
@@ -4039,6 +4137,1046 @@ public class FhirR4 {
   private static final String CANCEL_REASON_SYSTEM =
       "http://terminology.hl7.org/CodeSystem/appointment-cancellation-reason";
 
+  // ========================================================================================
+  // Location Hierarchy: Hospital → Department → Ward → Room → Bed
+  //
+  // Generates a realistic tree of Location resources using partOf references.
+  // Department is determined from encounter type and clinician specialty.
+  // Ward/Room/Bed are deterministically assigned per encounter.
+  // ========================================================================================
+
+  /** Department definitions: name → (SNOMED code, display) */
+  private static final Map<String, String[]> DEPARTMENTS = new LinkedHashMap<>();
+  static {
+    DEPARTMENTS.put("Innere Medizin", new String[]{"309904001", "Internal medicine"});
+    DEPARTMENTS.put("Chirurgie", new String[]{"394609007", "General surgery"});
+    DEPARTMENTS.put("Gynäkologie", new String[]{"394586005", "Gynecology"});
+    DEPARTMENTS.put("Pädiatrie", new String[]{"394537008", "Pediatric medicine"});
+    DEPARTMENTS.put("Neurologie", new String[]{"394591006", "Neurology"});
+    DEPARTMENTS.put("Kardiologie", new String[]{"394579002", "Cardiology"});
+    DEPARTMENTS.put("Orthopädie", new String[]{"394801008", "Orthopedic surgery"});
+    DEPARTMENTS.put("Urologie", new String[]{"394612005", "Urology"});
+    DEPARTMENTS.put("Radiologie", new String[]{"394914008", "Radiology"});
+    DEPARTMENTS.put("Anästhesie", new String[]{"394577000", "Anesthesiology"});
+    DEPARTMENTS.put("Notaufnahme", new String[]{"225728007", "Emergency department"});
+    DEPARTMENTS.put("Intensivstation", new String[]{"309905000", "Intensive care unit"});
+    DEPARTMENTS.put("Allgemeinmedizin", new String[]{"394802001", "General medicine"});
+    DEPARTMENTS.put("Onkologie", new String[]{"394593009", "Oncology"});
+    DEPARTMENTS.put("Dermatologie", new String[]{"394582007", "Dermatology"});
+    DEPARTMENTS.put("HNO", new String[]{"394649004", "Otorhinolaryngology"});
+    DEPARTMENTS.put("Augenheilkunde", new String[]{"394594003", "Ophthalmology"});
+    DEPARTMENTS.put("Psychiatrie", new String[]{"394587001", "Psychiatry"});
+  }
+
+  /** Map clinician specialty to department name. */
+  private static final Map<String, String> SPECIALTY_TO_DEPT = new HashMap<>();
+  static {
+    SPECIALTY_TO_DEPT.put("INTERNAL MEDICINE", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("GENERAL SURGERY", "Chirurgie");
+    SPECIALTY_TO_DEPT.put("OBSTETRICS/GYNECOLOGY", "Gynäkologie");
+    SPECIALTY_TO_DEPT.put("GYNECOLOGICAL ONCOLOGY", "Gynäkologie");
+    SPECIALTY_TO_DEPT.put("PEDIATRIC MEDICINE", "Pädiatrie");
+    SPECIALTY_TO_DEPT.put("NEUROLOGY", "Neurologie");
+    SPECIALTY_TO_DEPT.put("CARDIOVASCULAR DISEASE (CARDIOLOGY)", "Kardiologie");
+    SPECIALTY_TO_DEPT.put("CARDIAC SURGERY", "Chirurgie");
+    SPECIALTY_TO_DEPT.put("CARDIAC ELECTROPHYSIOLOGY", "Kardiologie");
+    SPECIALTY_TO_DEPT.put("INTERVENTIONAL CARDIOLOGY", "Kardiologie");
+    SPECIALTY_TO_DEPT.put("ORTHOPEDIC SURGERY", "Orthopädie");
+    SPECIALTY_TO_DEPT.put("UROLOGY", "Urologie");
+    SPECIALTY_TO_DEPT.put("DIAGNOSTIC RADIOLOGY", "Radiologie");
+    SPECIALTY_TO_DEPT.put("INTERVENTIONAL RADIOLOGY", "Radiologie");
+    SPECIALTY_TO_DEPT.put("ANESTHESIOLOGY", "Anästhesie");
+    SPECIALTY_TO_DEPT.put("EMERGENCY MEDICINE", "Notaufnahme");
+    SPECIALTY_TO_DEPT.put("CRITICAL CARE (INTENSIVISTS)", "Intensivstation");
+    SPECIALTY_TO_DEPT.put("GENERAL PRACTICE", "Allgemeinmedizin");
+    SPECIALTY_TO_DEPT.put("FAMILY PRACTICE", "Allgemeinmedizin");
+    SPECIALTY_TO_DEPT.put("HEMATOLOGY/ONCOLOGY", "Onkologie");
+    SPECIALTY_TO_DEPT.put("MEDICAL ONCOLOGY", "Onkologie");
+    SPECIALTY_TO_DEPT.put("DERMATOLOGY", "Dermatologie");
+    SPECIALTY_TO_DEPT.put("OTOLARYNGOLOGY", "HNO");
+    SPECIALTY_TO_DEPT.put("OPHTHALMOLOGY", "Augenheilkunde");
+    SPECIALTY_TO_DEPT.put("PSYCHIATRY", "Psychiatrie");
+    SPECIALTY_TO_DEPT.put("GASTROENTEROLOGY", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("ENDOCRINOLOGY", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("PULMONARY DISEASE", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("NEPHROLOGY", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("INFECTIOUS DISEASE", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("RHEUMATOLOGY", "Innere Medizin");
+    SPECIALTY_TO_DEPT.put("NURSE PRACTITIONER", "Allgemeinmedizin");
+    SPECIALTY_TO_DEPT.put("PHYSICIAN ASSISTANT", "Allgemeinmedizin");
+  }
+
+  /**
+   * Determine the appropriate department name for an encounter based on
+   * encounter type, clinician specialty, and clinical context.
+   *
+   * @param encounter the encounter
+   * @return department name (key into DEPARTMENTS map)
+   */
+  private static String determineDepartment(Encounter encounter) {
+    EncounterType encType = EncounterType.fromString(encounter.type);
+
+    // Emergency always goes to Notaufnahme
+    if (encType == EncounterType.EMERGENCY) {
+      return "Notaufnahme";
+    }
+
+    // If there's a clinician with a known specialty, map it
+    if (encounter.clinician != null) {
+      String specialty = (String) encounter.clinician.attributes.get(Clinician.SPECIALTY);
+      if (specialty != null) {
+        String dept = SPECIALTY_TO_DEPT.get(specialty);
+        if (dept != null) {
+          return dept;
+        }
+      }
+    }
+
+    // Encounter-type-based fallback
+    if (encType == EncounterType.INPATIENT) {
+      // Check if procedures indicate surgery
+      for (Procedure proc : encounter.procedures) {
+        String code = proc.codes.isEmpty() ? "" : proc.codes.get(0).display;
+        if (code.toLowerCase().contains("surg") || code.toLowerCase().contains("operation")
+            || code.toLowerCase().contains("repair") || code.toLowerCase().contains("ectomy")
+            || code.toLowerCase().contains("otomy")) {
+          return "Chirurgie";
+        }
+      }
+      return "Innere Medizin";
+    }
+
+    // Wellness / ambulatory
+    return "Allgemeinmedizin";
+  }
+
+  /** Track which department/ward/room/bed locations have been created per provider. */
+  private static final ThreadLocal<Map<String, BundleEntryComponent>> locationCache =
+      ThreadLocal.withInitial(HashMap::new);
+
+  /**
+   * Clear the location cache. Called at the start of each patient export via convertToFHIR.
+   */
+  private static void clearLocationCache() {
+    locationCache.get().clear();
+  }
+
+  /**
+   * Create or retrieve a department Location resource with the full hierarchy:
+   * Hospital → Department → Ward → Room → (Bed for inpatient).
+   *
+   * @param bundle       The Bundle to add to
+   * @param provider     The hospital/provider
+   * @param encounter    The encounter (determines department, room, bed)
+   * @param person       The person (for deterministic assignments)
+   * @return The most specific Location entry (bed for inpatient, room otherwise)
+   */
+  private static BundleEntryComponent encounterLocation(Bundle bundle, Provider provider,
+      Encounter encounter, Person person) {
+
+    Map<String, BundleEntryComponent> cache = locationCache.get();
+
+    String deptName = determineDepartment(encounter);
+    String provId = provider.getResourceID();
+
+    // --- Department level ---
+    String deptKey = provId + ":dept:" + deptName;
+    BundleEntryComponent deptEntry = cache.get(deptKey);
+    if (deptEntry == null) {
+      org.hl7.fhir.r4.model.Location dept = new org.hl7.fhir.r4.model.Location();
+      dept.setStatus(LocationStatus.ACTIVE);
+      dept.setName(deptName);
+      dept.setMode(org.hl7.fhir.r4.model.Location.LocationMode.INSTANCE);
+      String[] snomedCode = DEPARTMENTS.getOrDefault(deptName,
+          new String[]{"394802001", "General medicine"});
+      dept.addType(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, snomedCode[0], snomedCode[1]), SNOMED_URI));
+      dept.setPhysicalType(new CodeableConcept().addCoding(new Coding(
+          "http://terminology.hl7.org/CodeSystem/location-physical-type", "wi", "Wing")));
+      dept.setDescription(deptName + " - " + provider.name);
+      // partOf → hospital
+      String provLocId = provider.getResourceLocationID();
+      if (TRANSACTION_BUNDLE) {
+        dept.setPartOf(new Reference(
+            ExportHelper.buildFhirSearchUrl("Location", provLocId)));
+      } else {
+        String hospLocUrl = findLocationUrl(provider, bundle);
+        if (hospLocUrl != null) {
+          dept.setPartOf(new Reference(hospLocUrl));
+        }
+      }
+      dept.setManagingOrganization(new Reference()
+          .setIdentifier(new Identifier()
+              .setSystem(SYNTHEA_IDENTIFIER).setValue(provId))
+          .setDisplay(provider.name));
+      // Phone from provider
+      if (provider.phone != null && !provider.phone.isEmpty()) {
+        dept.addTelecom(new ContactPoint()
+            .setSystem(ContactPointSystem.PHONE).setValue(provider.phone));
+      }
+
+      String deptLocId = UUID.nameUUIDFromBytes(
+          (provId + "-dept-" + deptName).getBytes()).toString();
+      deptEntry = newEntry(bundle, dept, deptLocId);
+      cache.put(deptKey, deptEntry);
+    }
+
+    // --- Ward/Station level ---
+    // Deterministic ward number from encounter UUID
+    int wardNum = 1 + Math.abs(encounter.uuid.hashCode() % 3); // 3 wards per dept
+    String wardName = deptName + " Station " + wardNum;
+    String wardKey = provId + ":ward:" + deptName + ":" + wardNum;
+    BundleEntryComponent wardEntry = cache.get(wardKey);
+    if (wardEntry == null) {
+      org.hl7.fhir.r4.model.Location ward = new org.hl7.fhir.r4.model.Location();
+      ward.setStatus(LocationStatus.ACTIVE);
+      ward.setName(wardName);
+      ward.setMode(org.hl7.fhir.r4.model.Location.LocationMode.INSTANCE);
+      ward.setPhysicalType(new CodeableConcept().addCoding(new Coding(
+          "http://terminology.hl7.org/CodeSystem/location-physical-type", "wa", "Ward")));
+      ward.setPartOf(new Reference(deptEntry.getFullUrl()));
+      ward.setDescription(wardName + " - " + provider.name);
+
+      String wardLocId = UUID.nameUUIDFromBytes(
+          (provId + "-ward-" + deptName + "-" + wardNum).getBytes()).toString();
+      wardEntry = newEntry(bundle, ward, wardLocId);
+      cache.put(wardKey, wardEntry);
+    }
+
+    // --- Room level ---
+    EncounterType encType = EncounterType.fromString(encounter.type);
+    boolean hasProcedure = !encounter.procedures.isEmpty();
+    int roomNum;
+    String roomPrefix;
+
+    if (hasProcedure && (encType == EncounterType.INPATIENT
+        || encType == EncounterType.AMBULATORY || encType == EncounterType.OUTPATIENT)) {
+      // Operating room
+      roomNum = 1 + Math.abs((encounter.uuid.hashCode() * 7) % 4); // OP 1-4
+      roomPrefix = "OP-Saal";
+    } else if (encType == EncounterType.INPATIENT || encType == EncounterType.SNF
+        || encType == EncounterType.HOSPICE) {
+      // Patient room
+      roomNum = 100 + wardNum * 100 + Math.abs((encounter.uuid.hashCode() * 13) % 20);
+      roomPrefix = "Zimmer";
+    } else {
+      // Exam/treatment room
+      roomNum = 1 + Math.abs((encounter.uuid.hashCode() * 11) % 8); // rooms 1-8
+      roomPrefix = "Behandlungsraum";
+    }
+
+    String roomName = roomPrefix + " " + roomNum;
+    String roomKey = provId + ":room:" + deptName + ":" + wardNum + ":" + roomName;
+    BundleEntryComponent roomEntry = cache.get(roomKey);
+    if (roomEntry == null) {
+      org.hl7.fhir.r4.model.Location room = new org.hl7.fhir.r4.model.Location();
+      room.setStatus(LocationStatus.ACTIVE);
+      room.setName(roomName);
+      room.setMode(org.hl7.fhir.r4.model.Location.LocationMode.INSTANCE);
+      room.setPhysicalType(new CodeableConcept().addCoding(new Coding(
+          "http://terminology.hl7.org/CodeSystem/location-physical-type", "ro", "Room")));
+      room.setPartOf(new Reference(wardEntry.getFullUrl()));
+      room.setDescription(roomName + " - " + wardName + " - " + provider.name);
+
+      String roomLocId = UUID.nameUUIDFromBytes(
+          (provId + "-room-" + deptName + "-" + wardNum + "-" + roomName).getBytes()).toString();
+      roomEntry = newEntry(bundle, room, roomLocId);
+      cache.put(roomKey, roomEntry);
+    }
+
+    // --- Bed level (inpatient/SNF/hospice only) ---
+    if (encType == EncounterType.INPATIENT || encType == EncounterType.SNF
+        || encType == EncounterType.HOSPICE) {
+      int bedNum = 1 + Math.abs((encounter.uuid.hashCode() * 17) % 4); // 4 beds per room
+      String bedName = "Bett " + roomNum + "-" + bedNum;
+      String bedKey = provId + ":bed:" + deptName + ":" + wardNum + ":" + roomName + ":" + bedNum;
+      BundleEntryComponent bedEntry = cache.get(bedKey);
+      if (bedEntry == null) {
+        org.hl7.fhir.r4.model.Location bed = new org.hl7.fhir.r4.model.Location();
+        bed.setStatus(LocationStatus.ACTIVE);
+        bed.setName(bedName);
+        bed.setMode(org.hl7.fhir.r4.model.Location.LocationMode.INSTANCE);
+        bed.setPhysicalType(new CodeableConcept().addCoding(new Coding(
+            "http://terminology.hl7.org/CodeSystem/location-physical-type", "bd", "Bed")));
+        bed.setPartOf(new Reference(roomEntry.getFullUrl()));
+        bed.setDescription(bedName + " - " + roomName + " - " + wardName);
+        // For the bed, we can set operationalStatus (occupied/unoccupied)
+        // based on whether the encounter is still active
+        bed.setOperationalStatus(new Coding(
+            "http://terminology.hl7.org/CodeSystem/v2-0116",
+            "O", "Occupied"));
+
+        String bedLocId = UUID.nameUUIDFromBytes(
+            (provId + "-bed-" + deptName + "-" + wardNum + "-" + roomName
+                + "-" + bedNum).getBytes()).toString();
+        bedEntry = newEntry(bundle, bed, bedLocId);
+        cache.put(bedKey, bedEntry);
+      }
+      return bedEntry;
+    }
+
+    return roomEntry;
+  }
+
+  // ========================================================================================
+  // CommunicationRequest: appointment reminders, medication reminders
+  // ========================================================================================
+
+  /**
+   * Create a CommunicationRequest for an appointment reminder.
+   * Sent 1 day before the appointment.
+   *
+   * @param personEntry   Patient entry
+   * @param bundle        Bundle
+   * @param apptEntry     The Appointment entry
+   * @param encounter     The encounter
+   * @return The created entry
+   */
+  private static BundleEntryComponent appointmentReminder(BundleEntryComponent personEntry,
+      Bundle bundle, BundleEntryComponent apptEntry, Encounter encounter) {
+
+    CommunicationRequest commReq = new CommunicationRequest();
+    commReq.setStatus(CommunicationRequestStatus.COMPLETED);
+    commReq.setPriority(CommunicationPriority.ROUTINE);
+
+    // Category: notification
+    commReq.addCategory(new CodeableConcept().addCoding(new Coding(
+        "http://terminology.hl7.org/CodeSystem/communication-category",
+        "notification", "Notification")));
+
+    // Medium: phone or SMS
+    commReq.addMedium(new CodeableConcept().addCoding(new Coding(
+      "http://terminology.hl7.org/CodeSystem/v3-ParticipationMode",
+      "SMSWRIT", "SMS")));
+
+    commReq.setSubject(new Reference(personEntry.getFullUrl()));
+    commReq.addAbout(new Reference(apptEntry.getFullUrl()));
+
+    // Occurrence: 1 day before appointment
+    long reminderTime = encounter.start - 24L * 60 * 60 * 1000;
+    commReq.setOccurrence(new DateTimeType(new Date(reminderTime)));
+    commReq.setAuthoredOn(new Date(reminderTime));
+
+    // Payload: reminder text
+    CodeableConcept serviceType = encounterServiceType(encounter);
+    String serviceText = serviceType.hasText() ? serviceType.getText() : "Arzttermin";
+    String reminderText = String.format(
+        "Terminerinnerung: %s am %s. Bitte erscheinen Sie pünktlich.",
+        serviceText,
+        new java.text.SimpleDateFormat("dd.MM.yyyy 'um' HH:mm 'Uhr'")
+            .format(new Date(encounter.start)));
+    CommunicationRequest.CommunicationRequestPayloadComponent payload =
+        commReq.addPayload();
+    payload.setContent(new StringType(reminderText));
+
+    // Recipient: the patient
+    commReq.addRecipient(new Reference(personEntry.getFullUrl()));
+
+    // Requester: the organization
+    if (encounter.provider != null) {
+      if (TRANSACTION_BUNDLE) {
+        commReq.setRequester(new Reference(
+            ExportHelper.buildFhirSearchUrl("Organization",
+                encounter.provider.getResourceID())));
+      } else {
+        String provUrl = findProviderUrl(encounter.provider, bundle);
+        if (provUrl != null) {
+          commReq.setRequester(new Reference(provUrl));
+        }
+      }
+    }
+
+    String commId = UUID.nameUUIDFromBytes(
+        ("comm-appt-reminder-" + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, commReq, commId);
+  }
+
+  /**
+   * Create a CommunicationRequest for a medication reminder.
+   * Represents a scheduled reminder for the patient to take their medication.
+   *
+   * @param personEntry    Patient entry
+   * @param bundle         Bundle
+   * @param medReqEntry    The MedicationRequest entry
+   * @param medication     The medication
+   * @param encounter      The encounter where the medication was prescribed
+   * @return The created entry
+   */
+  private static BundleEntryComponent medicationReminder(BundleEntryComponent personEntry,
+      Bundle bundle, BundleEntryComponent medReqEntry,
+      Medication medication, Encounter encounter) {
+
+    CommunicationRequest commReq = new CommunicationRequest();
+    commReq.setStatus(CommunicationRequestStatus.ACTIVE);
+    commReq.setPriority(CommunicationPriority.ROUTINE);
+
+    commReq.addCategory(new CodeableConcept().addCoding(new Coding(
+        "http://terminology.hl7.org/CodeSystem/communication-category",
+        "reminder", "Reminder")));
+
+    commReq.addMedium(new CodeableConcept().addCoding(new Coding(
+      "http://terminology.hl7.org/CodeSystem/v3-ParticipationMode",
+      "SMSWRIT", "SMS")));
+
+    commReq.setSubject(new Reference(personEntry.getFullUrl()));
+    commReq.addAbout(new Reference(medReqEntry.getFullUrl()));
+
+    // Timing: same as medication schedule
+    Code medCode = medication.codes.get(0);
+    String medName = medCode.display;
+
+    String dosageText = "";
+    if (medication.prescriptionDetails != null) {
+      JsonObject rxInfo = medication.prescriptionDetails;
+      if (rxInfo.has("dosage")) {
+        double amount = rxInfo.get("dosage").getAsJsonObject().get("amount").getAsDouble();
+        dosageText = " (" + amount + " Einheiten)";
+      }
+    }
+
+    String reminderText = String.format(
+        "Medikamentenerinnerung: Bitte nehmen Sie %s%s ein.",
+        medName, dosageText);
+    commReq.addPayload().setContent(new StringType(reminderText));
+
+    commReq.addRecipient(new Reference(personEntry.getFullUrl()));
+    commReq.setAuthoredOn(new Date(medication.start));
+
+    // Occurrence window (R4 CommunicationRequest supports Period/dateTime)
+    Period occurrencePeriod = new Period().setStart(new Date(medication.start));
+    if (medication.stop != 0L) {
+      occurrencePeriod.setEnd(new Date(medication.stop));
+    }
+    commReq.setOccurrence(occurrencePeriod);
+
+    String commId = UUID.nameUUIDFromBytes(
+        ("comm-med-reminder-" + medication.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, commReq, commId);
+  }
+
+  // ========================================================================================
+  // Enhanced MedicationAdministration with scheduled times
+  // Generates individual administration events at specific times of day
+  // ========================================================================================
+
+  /**
+   * Generate multiple MedicationAdministration resources representing
+   * individual dose administrations at specific times (e.g. 08:00, 12:00, 20:00).
+   * This provides data for the nurse medication overview.
+   *
+   * @param person        The Person
+   * @param personEntry   Patient entry
+   * @param bundle        Bundle
+   * @param encounterEntry Encounter entry
+   * @param medication    The Medication
+   * @param medReqEntry   The MedicationRequest entry
+   */
+  private static void scheduledMedicationAdministrations(
+      Person person, BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Medication medication,
+      BundleEntryComponent medReqEntry) {
+
+    Code code = medication.codes.get(0);
+    String system = code.system.equals("SNOMED-CT") ? SNOMED_URI : RXNORM_URI;
+    CodeableConcept medConcept = mapCodeToCodeableConcept(code, system);
+
+    // Determine dosage frequency from prescriptionDetails
+    int timesPerDay = 1;
+    double doseAmount = 1.0;
+    String doseUnit = "dose";
+    if (medication.prescriptionDetails != null) {
+      JsonObject rxInfo = medication.prescriptionDetails;
+      if (rxInfo.has("dosage")) {
+        JsonObject dosage = rxInfo.get("dosage").getAsJsonObject();
+        if (dosage.has("amount")) {
+          doseAmount = dosage.get("amount").getAsDouble();
+        }
+        if (dosage.has("frequency")) {
+          timesPerDay = dosage.get("frequency").getAsInt();
+        }
+        if (dosage.has("unit")) {
+          doseUnit = dosage.get("unit").getAsString();
+        }
+      }
+    }
+
+    // Standard administration times based on frequency
+    int[] adminHours;
+    switch (timesPerDay) {
+      case 1: adminHours = new int[]{8}; break;
+      case 2: adminHours = new int[]{8, 20}; break;
+      case 3: adminHours = new int[]{8, 12, 20}; break;
+      case 4: adminHours = new int[]{6, 12, 18, 22}; break;
+      default: adminHours = new int[]{8}; break;
+    }
+
+    // Generate administrations for the last 7 days of the medication period
+    // (to avoid generating thousands for long-running medications)
+    long medEnd = medication.stop != 0L ? medication.stop : person.record.encounters
+        .get(person.record.encounters.size() - 1).start;
+    long sevenDaysMs = 7L * 24 * 60 * 60 * 1000;
+    long adminStart = Math.max(medication.start, medEnd - sevenDaysMs);
+
+    Calendar cal = Calendar.getInstance();
+    cal.setTimeInMillis(adminStart);
+    // Start at midnight
+    cal.set(Calendar.HOUR_OF_DAY, 0);
+    cal.set(Calendar.MINUTE, 0);
+    cal.set(Calendar.SECOND, 0);
+    cal.set(Calendar.MILLISECOND, 0);
+
+    int adminCount = 0;
+    int maxAdmins = 50; // cap per medication to prevent bundle bloat
+
+    while (cal.getTimeInMillis() <= medEnd && adminCount < maxAdmins) {
+      for (int hour : adminHours) {
+        cal.set(Calendar.HOUR_OF_DAY, hour);
+        cal.set(Calendar.MINUTE, 0);
+        long adminTime = cal.getTimeInMillis();
+        if (adminTime < adminStart || adminTime > medEnd || adminCount >= maxAdmins) {
+          continue;
+        }
+
+        MedicationAdministration admin = new MedicationAdministration();
+        admin.setStatus(
+            MedicationAdministration.MedicationAdministrationStatus.COMPLETED);
+        admin.setSubject(new Reference(personEntry.getFullUrl()));
+        admin.setContext(new Reference(encounterEntry.getFullUrl()));
+        admin.setMedication(medConcept);
+        admin.setEffective(new DateTimeType(new Date(adminTime)));
+
+        // Link to the MedicationRequest
+        admin.setRequest(new Reference(medReqEntry.getFullUrl()));
+
+        // Dosage with specific amount
+        MedicationAdministrationDosageComponent dosage =
+            new MedicationAdministrationDosageComponent();
+        dosage.setDose(new SimpleQuantity()
+            .setValue(doseAmount)
+            .setUnit(doseUnit)
+            .setSystem(UNITSOFMEASURE_URI));
+        dosage.setText(String.format("%.1f %s um %02d:00 Uhr", doseAmount, doseUnit, hour));
+        admin.setDosage(dosage);
+
+        // Performer (nurse)
+        org.hl7.fhir.r4.model.Encounter encResource =
+            (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+        if (encResource.hasParticipant()) {
+          MedicationAdministration.MedicationAdministrationPerformerComponent performer =
+              admin.addPerformer();
+          performer.setActor(encResource.getParticipantFirstRep().getIndividual());
+        }
+
+        String adminId = UUID.nameUUIDFromBytes(
+            ("med-admin-" + medication.uuid + "-" + adminTime).getBytes()).toString();
+        newEntry(bundle, admin, adminId);
+        adminCount++;
+      }
+      // Advance to next day
+      cal.add(Calendar.DAY_OF_MONTH, 1);
+    }
+  }
+
+  // ========================================================================================
+  // CarePlan enhancement: medication schedule activities with specific times
+  // ========================================================================================
+
+  /**
+   * Create or enhance a CarePlan with medication schedule activities.
+   * This shows "what meds are due when" for the nurse overview.
+   *
+   * @param personEntry   Patient entry
+   * @param bundle        Bundle
+   * @param encounterEntry Encounter entry
+   * @param encounter     The encounter
+   * @param medications   Active medications from this encounter
+   * @return The CarePlan entry
+   */
+  private static BundleEntryComponent medicationCarePlan(
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Encounter encounter,
+      List<Medication> medications) {
+
+    org.hl7.fhir.r4.model.CarePlan carePlan = new org.hl7.fhir.r4.model.CarePlan();
+    carePlan.setStatus(CarePlanStatus.ACTIVE);
+    carePlan.setIntent(CarePlanIntent.ORDER);
+    carePlan.setSubject(new Reference(personEntry.getFullUrl()));
+    carePlan.setEncounter(new Reference(encounterEntry.getFullUrl()));
+
+    carePlan.addCategory(new CodeableConcept().addCoding(new Coding(
+        "http://hl7.org/fhir/us/core/CodeSystem/careplan-category",
+        "assess-plan", "Assessment and Plan of Treatment")));
+
+    // Medication schedule category
+    carePlan.addCategory(new CodeableConcept().addCoding(new Coding(
+        SNOMED_URI, "430193006", "Medication management")));
+
+    carePlan.setTitle("Medikationsplan");
+    carePlan.setDescription("Medikationsplan für " + encounter.provider.name);
+    carePlan.setPeriod(new Period()
+        .setStart(new Date(encounter.start))
+        .setEnd(encounter.stop != 0L ? new Date(encounter.stop) : null));
+
+    for (Medication med : medications) {
+      Code medCode = med.codes.get(0);
+      CarePlanActivityComponent activity = carePlan.addActivity();
+
+      CarePlanActivityDetailComponent detail = activity.getDetail();
+      detail.setStatus(med.stop != 0L && med.stop < encounter.stop
+          ? CarePlanActivityStatus.COMPLETED : CarePlanActivityStatus.INPROGRESS);
+      detail.setKind(org.hl7.fhir.r4.model.CarePlan.CarePlanActivityKind.MEDICATIONREQUEST);
+      detail.setCode(mapCodeToCodeableConcept(medCode,
+          medCode.system.equals("SNOMED-CT") ? SNOMED_URI : RXNORM_URI));
+      detail.setDescription(medCode.display);
+
+      // Scheduled timing
+      Timing timing = new Timing();
+      TimingRepeatComponent repeat = new TimingRepeatComponent();
+      int freq = 1;
+      if (med.prescriptionDetails != null && med.prescriptionDetails.has("dosage")) {
+        JsonObject dosage = med.prescriptionDetails.get("dosage").getAsJsonObject();
+        if (dosage.has("frequency")) {
+          freq = dosage.get("frequency").getAsInt();
+        }
+      }
+      repeat.setFrequency(freq);
+      repeat.setPeriod(1);
+      repeat.setPeriodUnit(UnitsOfTime.D);
+
+      // Time of day
+      switch (freq) {
+        case 1: repeat.addTimeOfDay("08:00:00"); break;
+        case 2: repeat.addTimeOfDay("08:00:00"); repeat.addTimeOfDay("20:00:00"); break;
+        case 3:
+          repeat.addTimeOfDay("08:00:00");
+          repeat.addTimeOfDay("12:00:00");
+          repeat.addTimeOfDay("20:00:00");
+          break;
+        default: repeat.addTimeOfDay("08:00:00"); break;
+      }
+
+      timing.setRepeat(repeat);
+      detail.setScheduled(timing);
+
+      // Dosage amount
+      if (med.prescriptionDetails != null && med.prescriptionDetails.has("dosage")) {
+        JsonObject dosage = med.prescriptionDetails.get("dosage").getAsJsonObject();
+        if (dosage.has("amount")) {
+          SimpleQuantity qty = new SimpleQuantity();
+          qty.setValue(dosage.get("amount").getAsDouble());
+          if (dosage.has("unit")) {
+            qty.setUnit(dosage.get("unit").getAsString());
+          }
+          detail.setDailyAmount(qty);
+        }
+      }
+    }
+
+    String cpId = UUID.nameUUIDFromBytes(
+        ("med-careplan-" + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, carePlan, cpId);
+  }
+
+  // ========================================================================================
+  // Discharge Planning: CareTeam + discharge CarePlan with follow-up appointments
+  // ========================================================================================
+
+  /**
+   * Create a discharge planning CarePlan for inpatient encounters.
+   * Includes expected discharge date, follow-up appointment references,
+   * and links to the CareTeam.
+   *
+   * @param personEntry    Patient entry
+   * @param bundle         Bundle
+   * @param encounterEntry Encounter entry
+   * @param encounter      The inpatient encounter
+   * @param careTeamEntry  The CareTeam entry (may be null)
+   * @return The discharge CarePlan entry
+   */
+  private static BundleEntryComponent dischargePlan(
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Encounter encounter,
+      BundleEntryComponent careTeamEntry) {
+
+    org.hl7.fhir.r4.model.CarePlan dischargeCp = new org.hl7.fhir.r4.model.CarePlan();
+    dischargeCp.setStatus(encounter.ended ? CarePlanStatus.COMPLETED : CarePlanStatus.ACTIVE);
+    dischargeCp.setIntent(CarePlanIntent.PLAN);
+    dischargeCp.setSubject(new Reference(personEntry.getFullUrl()));
+    dischargeCp.setEncounter(new Reference(encounterEntry.getFullUrl()));
+
+    dischargeCp.addCategory(new CodeableConcept().addCoding(new Coding(
+        SNOMED_URI, "58000006", "Discharge planning")));
+    dischargeCp.setTitle("Entlassungsplanung");
+
+    // Period: from admission to planned discharge
+    long plannedDischarge = encounter.stop;
+    dischargeCp.setPeriod(new Period()
+        .setStart(new Date(encounter.start))
+        .setEnd(new Date(plannedDischarge)));
+
+    dischargeCp.setDescription(String.format(
+        "Entlassungsplanung für stationären Aufenthalt in %s",
+        encounter.provider != null ? encounter.provider.name : "Krankenhaus"));
+
+    // Link to CareTeam
+    if (careTeamEntry != null) {
+      dischargeCp.addCareTeam(new Reference(careTeamEntry.getFullUrl()));
+    }
+
+    // Activity: Discharge assessment
+    CarePlanActivityComponent assessActivity = dischargeCp.addActivity();
+    CarePlanActivityDetailComponent assessDetail = assessActivity.getDetail();
+    assessDetail.setStatus(encounter.ended
+        ? CarePlanActivityStatus.COMPLETED : CarePlanActivityStatus.SCHEDULED);
+    assessDetail.setKind(
+        org.hl7.fhir.r4.model.CarePlan.CarePlanActivityKind.APPOINTMENT);
+    assessDetail.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "183665006", "Discharge assessment"), SNOMED_URI));
+    assessDetail.setDescription("Entlassungsuntersuchung und Arztbrief");
+
+    // Scheduled discharge date
+    Timing dischargeTiming = new Timing();
+    TimingRepeatComponent tr = new TimingRepeatComponent();
+    tr.setBounds(new Period().setEnd(new Date(plannedDischarge)));
+    dischargeTiming.setRepeat(tr);
+    assessDetail.setScheduled(dischargeTiming);
+
+    // Activity: Follow-up appointment (2 weeks after discharge)
+    long followUpTime = plannedDischarge + 14L * 24 * 60 * 60 * 1000;
+    CarePlanActivityComponent followUpActivity = dischargeCp.addActivity();
+    CarePlanActivityDetailComponent followUpDetail = followUpActivity.getDetail();
+    followUpDetail.setStatus(CarePlanActivityStatus.SCHEDULED);
+    followUpDetail.setKind(
+        org.hl7.fhir.r4.model.CarePlan.CarePlanActivityKind.APPOINTMENT);
+    followUpDetail.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "390906007", "Follow-up encounter"), SNOMED_URI));
+    followUpDetail.setDescription("Nachsorgetermin");
+    Timing fuTiming = new Timing();
+    fuTiming.addEvent(new Date(followUpTime));
+    followUpDetail.setScheduled(fuTiming);
+
+    // Activity: Medication reconciliation
+    CarePlanActivityComponent medRecActivity = dischargeCp.addActivity();
+    CarePlanActivityDetailComponent medRecDetail = medRecActivity.getDetail();
+    medRecDetail.setStatus(encounter.ended
+        ? CarePlanActivityStatus.COMPLETED : CarePlanActivityStatus.INPROGRESS);
+    medRecDetail.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "430193006", "Medication management"), SNOMED_URI));
+    medRecDetail.setDescription("Medikationsabgleich bei Entlassung");
+
+    String cpId = UUID.nameUUIDFromBytes(
+        ("discharge-plan-" + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, dischargeCp, cpId);
+  }
+
+  /**
+   * Create an enhanced CareTeam for discharge planning with proper roles.
+   *
+   * @param personEntry    Patient entry
+   * @param bundle         Bundle
+   * @param encounterEntry Encounter entry
+   * @param encounter      The encounter
+   * @return The CareTeam entry
+   */
+  private static BundleEntryComponent dischargeCareTeam(
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Encounter encounter) {
+
+    CareTeam team = new CareTeam();
+    team.setStatus(encounter.ended ? CareTeamStatus.INACTIVE : CareTeamStatus.ACTIVE);
+    team.setName("Behandlungsteam - " + (encounter.provider != null
+        ? encounter.provider.name : "Krankenhaus"));
+    team.setSubject(new Reference(personEntry.getFullUrl()));
+    team.setEncounter(new Reference(encounterEntry.getFullUrl()));
+    team.setPeriod(new Period()
+        .setStart(new Date(encounter.start))
+        .setEnd(encounter.stop != 0L ? new Date(encounter.stop) : null));
+
+    team.addCategory(new CodeableConcept().addCoding(new Coding(
+        "http://loinc.org", "LA28866-4", "Healthcare")));
+
+    // Participant: attending physician
+    if (encounter.clinician != null) {
+      CareTeamParticipantComponent physician = team.addParticipant();
+      physician.addRole(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, "223366009", "Attending physician"), SNOMED_URI));
+      physician.setMember(clinicianReference(encounter.clinician, bundle));
+      physician.setPeriod(new Period().setStart(new Date(encounter.start)));
+    }
+
+    // Participant: nursing staff (use scheduler clinician)
+    Clinician nurse = findSchedulingClinician(encounter, null);
+    if (nurse != null) {
+      CareTeamParticipantComponent nurseParticipant = team.addParticipant();
+      nurseParticipant.addRole(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, "224535009", "Registered nurse"), SNOMED_URI));
+      nurseParticipant.setMember(clinicianReference(nurse, bundle));
+      nurseParticipant.setPeriod(new Period().setStart(new Date(encounter.start)));
+    }
+
+    // Participant: patient
+    CareTeamParticipantComponent patient = team.addParticipant();
+    patient.addRole(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "116154003", "Patient"), SNOMED_URI));
+    patient.setMember(new Reference(personEntry.getFullUrl()));
+
+    // Participant: organization
+    if (encounter.provider != null) {
+      CareTeamParticipantComponent org = team.addParticipant();
+      org.addRole(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, "224891009", "Healthcare services"), SNOMED_URI));
+      if (TRANSACTION_BUNDLE) {
+        org.setMember(new Reference(ExportHelper.buildFhirSearchUrl(
+            "Organization", encounter.provider.getResourceID())));
+      } else {
+        String provUrl = findProviderUrl(encounter.provider, bundle);
+        if (provUrl != null) {
+          org.setMember(new Reference(provUrl));
+        }
+      }
+    }
+
+    String teamId = UUID.nameUUIDFromBytes(
+        ("discharge-careteam-" + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, team, teamId);
+  }
+
+  /**
+   * Create nurse handover tasks for dashboard workflows.
+   * Includes medication rounds, lab review and shift handoff.
+   */
+  private static void nurseHandoverTasks(
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Encounter encounter,
+      List<BundleEntryComponent> medReqEntries) {
+
+    org.hl7.fhir.r4.model.Encounter encounterResource =
+        (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+    Reference owner = encounterResource.hasParticipant()
+        ? encounterResource.getParticipantFirstRep().getIndividual()
+        : null;
+
+    if (!medReqEntries.isEmpty()) {
+      Task medTask = new Task();
+      medTask.setStatus(encounter.ended ? TaskStatus.COMPLETED : TaskStatus.INPROGRESS);
+      medTask.setIntent(TaskIntent.ORDER);
+      medTask.setPriority(Task.TaskPriority.ROUTINE);
+      medTask.setCode(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, "182849000", "Drug administration"), SNOMED_URI));
+      medTask.setDescription("Pflegeaufgabe: Medikationsrunde und Adhärenzprüfung");
+      medTask.setFor(new Reference(personEntry.getFullUrl()));
+      medTask.setEncounter(new Reference(encounterEntry.getFullUrl()));
+      medTask.setAuthoredOn(new Date(encounter.start));
+      medTask.setExecutionPeriod(new Period()
+          .setStart(new Date(encounter.start))
+          .setEnd(encounter.stop != 0L ? new Date(encounter.stop) : null));
+      if (owner != null) {
+        medTask.setRequester(owner);
+        medTask.setOwner(owner);
+      }
+      for (BundleEntryComponent medReqEntry : medReqEntries) {
+        medTask.addBasedOn(new Reference(medReqEntry.getFullUrl()));
+      }
+
+      String medTaskId = UUID.nameUUIDFromBytes(
+          ("nurse-med-round-" + encounter.uuid.toString()).getBytes()).toString();
+      newEntry(bundle, medTask, medTaskId);
+    }
+
+    if (!encounter.reports.isEmpty()) {
+      Task labTask = new Task();
+      labTask.setStatus(encounter.ended ? TaskStatus.COMPLETED : TaskStatus.READY);
+      labTask.setIntent(TaskIntent.ORDER);
+      labTask.setPriority(Task.TaskPriority.ASAP);
+      labTask.setCode(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, "386344002", "Laboratory data interpretation"), SNOMED_URI));
+      labTask.setDescription("Pflegeaufgabe: Auffällige Laborwerte prüfen und rückmelden");
+      labTask.setFor(new Reference(personEntry.getFullUrl()));
+      labTask.setEncounter(new Reference(encounterEntry.getFullUrl()));
+      labTask.setAuthoredOn(new Date(encounter.start));
+      if (owner != null) {
+        labTask.setRequester(owner);
+        labTask.setOwner(owner);
+      }
+
+      String labTaskId = UUID.nameUUIDFromBytes(
+          ("nurse-lab-review-" + encounter.uuid.toString()).getBytes()).toString();
+      newEntry(bundle, labTask, labTaskId);
+    }
+
+    Task handoffTask = new Task();
+    handoffTask.setStatus(encounter.ended ? TaskStatus.COMPLETED : TaskStatus.READY);
+    handoffTask.setIntent(TaskIntent.ORDER);
+    handoffTask.setPriority(Task.TaskPriority.ROUTINE);
+    handoffTask.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "225725005", "Nursing handover"), SNOMED_URI));
+    handoffTask.setDescription("Schichtübergabe: offene Punkte, Risiken und nächste Schritte");
+    handoffTask.setFor(new Reference(personEntry.getFullUrl()));
+    handoffTask.setEncounter(new Reference(encounterEntry.getFullUrl()));
+    handoffTask.setAuthoredOn(new Date(encounter.start));
+    if (owner != null) {
+      handoffTask.setRequester(owner);
+      handoffTask.setOwner(owner);
+    }
+
+    String handoffTaskId = UUID.nameUUIDFromBytes(
+        ("nurse-handover-" + encounter.uuid.toString()).getBytes()).toString();
+    newEntry(bundle, handoffTask, handoffTaskId);
+  }
+
+  /**
+   * Add discharge follow-up workflow artifacts for post-discharge coordination.
+   */
+  private static void dischargeFollowUpWorkflow(
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Encounter encounter,
+      BundleEntryComponent careTeamEntry) {
+    long dischargeTime = encounter.stop != 0L ? encounter.stop : encounter.start;
+    long outreachTime = dischargeTime + 48L * 60 * 60 * 1000;
+
+    if (shouldExport(Task.class)) {
+      Task followUpTask = new Task();
+      followUpTask.setStatus(encounter.ended ? TaskStatus.REQUESTED : TaskStatus.DRAFT);
+      followUpTask.setIntent(TaskIntent.PLAN);
+      followUpTask.setPriority(Task.TaskPriority.ROUTINE);
+      followUpTask.setCode(mapCodeToCodeableConcept(
+          new Code(SNOMED_URI, "390906007", "Follow-up encounter"), SNOMED_URI));
+      followUpTask.setDescription("Nachsorge: Telefonkontakt 48h nach Entlassung");
+      followUpTask.setFor(new Reference(personEntry.getFullUrl()));
+      followUpTask.setEncounter(new Reference(encounterEntry.getFullUrl()));
+      followUpTask.setAuthoredOn(new Date(dischargeTime));
+      followUpTask.setExecutionPeriod(new Period().setStart(new Date(outreachTime)));
+      if (careTeamEntry != null) {
+        followUpTask.addBasedOn(new Reference(careTeamEntry.getFullUrl()));
+      }
+
+      String followTaskId = UUID.nameUUIDFromBytes(
+          ("discharge-followup-task-" + encounter.uuid.toString()).getBytes()).toString();
+      newEntry(bundle, followUpTask, followTaskId);
+    }
+
+    if (shouldExport(CommunicationRequest.class)) {
+      CommunicationRequest followCom = new CommunicationRequest();
+      followCom.setStatus(encounter.ended
+          ? CommunicationRequestStatus.ACTIVE : CommunicationRequestStatus.DRAFT);
+      followCom.setPriority(CommunicationPriority.ROUTINE);
+      followCom.setSubject(new Reference(personEntry.getFullUrl()));
+      followCom.addRecipient(new Reference(personEntry.getFullUrl()));
+      followCom.addCategory(new CodeableConcept().addCoding(new Coding(
+          "http://terminology.hl7.org/CodeSystem/communication-category",
+          "instruction", "Instruction")));
+      followCom.addPayload().setContent(new StringType(
+          "Bitte melden Sie sich 48 Stunden nach Entlassung für die Nachsorge."));
+      followCom.setAuthoredOn(new Date(dischargeTime));
+      followCom.setOccurrence(new DateTimeType(new Date(outreachTime)));
+
+      String followComId = UUID.nameUUIDFromBytes(
+          ("discharge-followup-comm-" + encounter.uuid.toString()).getBytes()).toString();
+      newEntry(bundle, followCom, followComId);
+    }
+  }
+
+  /**
+   * Build tumorboard v1 (preparation) and v2 (post-board plan) CarePlans.
+   */
+  private static void tumorBoardCarePlans(
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, Encounter encounter) {
+    long boardTime = encounter.start + Math.max(15L * 60 * 1000,
+        (encounter.stop - encounter.start) / 2);
+
+    org.hl7.fhir.r4.model.CarePlan preBoard = new org.hl7.fhir.r4.model.CarePlan();
+    preBoard.setStatus(encounter.ended ? CarePlanStatus.COMPLETED : CarePlanStatus.ACTIVE);
+    preBoard.setIntent(CarePlanIntent.PLAN);
+    preBoard.setTitle("Tumorboard v1 - Vorbereitung");
+    preBoard.setSubject(new Reference(personEntry.getFullUrl()));
+    preBoard.setEncounter(new Reference(encounterEntry.getFullUrl()));
+    preBoard.addCategory(new CodeableConcept().addCoding(new Coding(
+        SNOMED_URI, "734163000", "Multidisciplinary cancer care")));
+    preBoard.setDescription("Vorbereitung für prätherapeutisches Tumorboard mit Diagnostik-Review");
+    preBoard.setPeriod(new Period().setStart(new Date(encounter.start)).setEnd(new Date(boardTime)));
+
+    CarePlanActivityDetailComponent preDataReview = preBoard.addActivity().getDetail();
+    preDataReview.setStatus(encounter.ended
+        ? CarePlanActivityStatus.COMPLETED : CarePlanActivityStatus.SCHEDULED);
+    preDataReview.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "698247007", "Multidisciplinary review"), SNOMED_URI));
+    preDataReview.setDescription("Radiologie, Pathologie und Komorbiditäten für Tumorboard aufbereiten");
+
+    CarePlanActivityDetailComponent preCaseSummary = preBoard.addActivity().getDetail();
+    preCaseSummary.setStatus(encounter.ended
+        ? CarePlanActivityStatus.COMPLETED : CarePlanActivityStatus.SCHEDULED);
+    preCaseSummary.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "371531000", "Clinical case summary"), SNOMED_URI));
+    preCaseSummary.setDescription("Tumorboard v1 Fallzusammenfassung bereitstellen");
+
+    String preBoardId = UUID.nameUUIDFromBytes(
+        ("tumorboard-v1-" + encounter.uuid.toString()).getBytes()).toString();
+    BundleEntryComponent preBoardEntry = newEntry(bundle, preBoard, preBoardId);
+
+    org.hl7.fhir.r4.model.CarePlan postBoard = new org.hl7.fhir.r4.model.CarePlan();
+    postBoard.setStatus(encounter.ended ? CarePlanStatus.ACTIVE : CarePlanStatus.DRAFT);
+    postBoard.setIntent(CarePlanIntent.ORDER);
+    postBoard.setTitle("Tumorboard v2 - Nachbesprechung");
+    postBoard.setSubject(new Reference(personEntry.getFullUrl()));
+    postBoard.setEncounter(new Reference(encounterEntry.getFullUrl()));
+    postBoard.addCategory(new CodeableConcept().addCoding(new Coding(
+        SNOMED_URI, "734163000", "Multidisciplinary cancer care")));
+    postBoard.setDescription("Therapieempfehlung und Nachsorge nach Tumorboard-Beschluss");
+    postBoard.setPeriod(new Period().setStart(new Date(boardTime))
+        .setEnd(encounter.stop != 0L ? new Date(encounter.stop) : null));
+    postBoard.addBasedOn(new Reference(preBoardEntry.getFullUrl()));
+
+    CarePlanActivityDetailComponent postDecision = postBoard.addActivity().getDetail();
+    postDecision.setStatus(encounter.ended
+        ? CarePlanActivityStatus.SCHEDULED : CarePlanActivityStatus.NOTSTARTED);
+    postDecision.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "735324008", "Oncology treatment plan"), SNOMED_URI));
+    postDecision.setDescription("Tumorboard v2: Therapieplan finalisieren und kommunizieren");
+
+    CarePlanActivityDetailComponent postPrep = postBoard.addActivity().getDetail();
+    postPrep.setStatus(encounter.ended
+        ? CarePlanActivityStatus.SCHEDULED : CarePlanActivityStatus.NOTSTARTED);
+    postPrep.setCode(mapCodeToCodeableConcept(
+        new Code(SNOMED_URI, "386053000", "Evaluation procedure"), SNOMED_URI));
+    postPrep.setDescription("OP-/Systemtherapie-Vorbereitung und Terminierung");
+
+    String postBoardId = UUID.nameUUIDFromBytes(
+        ("tumorboard-v2-" + encounter.uuid.toString()).getBytes()).toString();
+    newEntry(bundle, postBoard, postBoardId);
+  }
+
+  /**
+   * Determine if encounter looks oncology-related and should get tumorboard plans.
+   */
+  private static boolean isTumorBoardCandidate(Encounter encounter) {
+    if (encounter == null) {
+      return false;
+    }
+
+    for (HealthRecord.Entry condition : encounter.conditions) {
+      for (Code code : condition.codes) {
+        String text = (code.display == null ? "" : code.display).toLowerCase();
+        if (text.contains("cancer") || text.contains("carcinoma")
+            || text.contains("neoplasm") || text.contains("tumor")) {
+          return true;
+        }
+      }
+    }
+
+    for (Procedure procedure : encounter.procedures) {
+      for (Code code : procedure.codes) {
+        String text = (code.display == null ? "" : code.display).toLowerCase();
+        if (text.contains("oncolog") || text.contains("tumor")
+            || text.contains("biopsy") || text.contains("resection")) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
   /**
    * Returns true if the given encounter type represents an unscheduled (walk-in) visit.
    * Emergency and Urgent Care encounters are considered unscheduled.
@@ -4081,17 +5219,18 @@ public class FhirR4 {
       return null;
     }
     String display = clinician.getFullname();
-    if (TRANSACTION_BUNDLE) {
-      return new Reference(ExportHelper.buildFhirNpiSearchUrl(clinician))
-          .setDisplay(display);
-    } else {
-      String url = findPractitioner(clinician, bundle);
-      if (url != null) {
-        return new Reference(url).setDisplay(display);
-      }
+    String url = findPractitioner(clinician, bundle);
+    if (url != null) {
+      return new Reference(url).setDisplay(display);
+    }
+
+    if (shouldExport(Practitioner.class)) {
       BundleEntryComponent entry = practitioner(bundle, clinician);
       return new Reference(entry.getFullUrl()).setDisplay(display);
     }
+
+    return new Reference(ExportHelper.buildFhirNpiSearchUrl(clinician))
+        .setDisplay(display);
   }
 
   /**
@@ -4118,7 +5257,10 @@ public class FhirR4 {
     for (String specialty : schedulerSpecialties) {
       ArrayList<Clinician> nurses = provider.clinicianMap.get(specialty);
       if (nurses != null && !nurses.isEmpty()) {
-        return nurses.get(person.randInt(nurses.size()));
+        if (person != null) {
+          return nurses.get(person.randInt(nurses.size()));
+        }
+        return nurses.get(0);
       }
     }
     // Fallback: use a different clinician from general practice if possible
