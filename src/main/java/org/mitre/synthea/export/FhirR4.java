@@ -30,6 +30,10 @@ import org.hl7.fhir.r4.model.AllergyIntolerance;
 import org.hl7.fhir.r4.model.AllergyIntolerance.AllergyIntoleranceCategory;
 import org.hl7.fhir.r4.model.AllergyIntolerance.AllergyIntoleranceCriticality;
 import org.hl7.fhir.r4.model.AllergyIntolerance.AllergyIntoleranceType;
+import org.hl7.fhir.r4.model.Appointment;
+import org.hl7.fhir.r4.model.Appointment.AppointmentParticipantComponent;
+import org.hl7.fhir.r4.model.Appointment.AppointmentStatus;
+import org.hl7.fhir.r4.model.Appointment.ParticipationStatus;
 import org.hl7.fhir.r4.model.BooleanType;
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Bundle.BundleEntryComponent;
@@ -122,12 +126,18 @@ import org.hl7.fhir.r4.model.Provenance.ProvenanceAgentComponent;
 import org.hl7.fhir.r4.model.Quantity;
 import org.hl7.fhir.r4.model.Reference;
 import org.hl7.fhir.r4.model.Resource;
+import org.hl7.fhir.r4.model.Schedule;
 import org.hl7.fhir.r4.model.ServiceRequest;
 import org.hl7.fhir.r4.model.SimpleQuantity;
+import org.hl7.fhir.r4.model.Slot;
+import org.hl7.fhir.r4.model.Slot.SlotStatus;
 import org.hl7.fhir.r4.model.StringType;
 import org.hl7.fhir.r4.model.SupplyDelivery;
 import org.hl7.fhir.r4.model.SupplyDelivery.SupplyDeliveryStatus;
 import org.hl7.fhir.r4.model.SupplyDelivery.SupplyDeliverySuppliedItemComponent;
+import org.hl7.fhir.r4.model.Task;
+import org.hl7.fhir.r4.model.Task.TaskIntent;
+import org.hl7.fhir.r4.model.Task.TaskStatus;
 import org.hl7.fhir.r4.model.Timing;
 import org.hl7.fhir.r4.model.Timing.TimingRepeatComponent;
 import org.hl7.fhir.r4.model.Timing.UnitsOfTime;
@@ -513,6 +523,57 @@ public class FhirR4 {
         if (shouldExport(ExplanationOfBenefit.class)) {
           explanationOfBenefit(personEntry, bundle, encounterEntry, person,
               encounterClaim, encounter, encounter.claim);
+        }
+      }
+
+      // ====== Patient Journey / Scheduling Resources ======
+      // Schedule → Slot → Appointment (for scheduled encounters)
+      // ServiceRequest + Task (for procedures and imaging studies)
+      BundleEntryComponent scheduleEntry = null;
+      BundleEntryComponent slotEntry = null;
+
+      if (shouldExport(Schedule.class)) {
+        scheduleEntry = schedule(personEntry, bundle, encounterEntry, encounter);
+      }
+
+      if (shouldExport(Slot.class) && scheduleEntry != null) {
+        slotEntry = slot(bundle, scheduleEntry, encounter);
+      }
+
+      if (shouldExport(Appointment.class) && slotEntry != null
+          && !isUnscheduledEncounter(encounter)) {
+        appointment(person, personEntry, bundle, encounterEntry, slotEntry, encounter);
+      }
+
+      if (shouldExport(ServiceRequest.class)) {
+        // Create ServiceRequests for each Procedure
+        for (Procedure procedure : encounter.procedures) {
+          Code procCode = procedure.codes.get(0);
+          Code reasonCode = procedure.reasons.isEmpty() ? null : procedure.reasons.get(0);
+          BundleEntryComponent srEntry = serviceRequest(personEntry, bundle,
+              encounterEntry, encounter, procCode, reasonCode,
+              procedure.uuid.toString(), procedure.start);
+
+          // Create a Task to track fulfilment of this ServiceRequest
+          if (shouldExport(Task.class)) {
+            task(personEntry, bundle, encounterEntry, srEntry, encounter,
+                procCode, procedure.start,
+                procedure.stop != 0L ? procedure.stop : 0L);
+          }
+        }
+
+        // Create ServiceRequests for each ImagingStudy
+        for (ImagingStudy imagingStudy : encounter.imagingStudies) {
+          Code imgCode = imagingStudy.codes.get(0);
+          BundleEntryComponent srEntry = serviceRequest(personEntry, bundle,
+              encounterEntry, encounter, imgCode, null,
+              imagingStudy.uuid.toString(), imagingStudy.start);
+
+          if (shouldExport(Task.class)) {
+            task(personEntry, bundle, encounterEntry, srEntry, encounter,
+                imgCode, imagingStudy.start,
+                imagingStudy.stop != 0L ? imagingStudy.stop : imagingStudy.start);
+          }
         }
       }
     }
@@ -3424,6 +3485,702 @@ public class FhirR4 {
     to.addCoding(coding);
 
     return to;
+  }
+
+  // ========================================================================================
+  // Patient Journey / Scheduling Resources
+  // Schedule, Slot, Appointment, ServiceRequest (standalone), Task
+  //
+  // Realistic appointment lifecycle simulation:
+  //   ~80% fulfilled  - patient attended
+  //   ~8%  cancelled  - cancelled and rescheduled 1-14 days later
+  //   ~5%  noshow     - patient did not attend
+  //   ~5%  booked     - future appointment (not yet attended)
+  //   ~2%  waitlisted - on a waiting list
+  //
+  // Rich participant model:
+  //   - Primary performer (PPRF): the encounter clinician / physician
+  //   - Scheduler (ATND): a nurse or admin staff from the same provider
+  //   - Referring practitioner (REF): the patient's wellness/PCP clinician
+  //     (for non-wellness encounters only)
+  //   - Location: the encounter location
+  //   - PractitionerRole: emitted with the clinician's ACTUAL specialty
+  // ========================================================================================
+
+  /** Probability thresholds for appointment lifecycle statuses (cumulative). */
+  private static final double APPT_PROB_FULFILLED = 0.80;
+  private static final double APPT_PROB_CANCELLED = 0.88;  // 8% cancelled
+  private static final double APPT_PROB_NOSHOW    = 0.93;   // 5% noshow
+  private static final double APPT_PROB_BOOKED    = 0.98;   // 5% booked (future)
+  // remaining 2% = waitlisted
+
+  /** Cancellation reason codes (FHIR appointment-cancellation-reason). */
+  private static final String CANCEL_REASON_SYSTEM =
+      "http://terminology.hl7.org/CodeSystem/appointment-cancellation-reason";
+
+  /**
+   * Returns true if the given encounter type represents an unscheduled (walk-in) visit.
+   * Emergency and Urgent Care encounters are considered unscheduled.
+   *
+   * @param encounter the encounter to check
+   * @return true if unscheduled
+   */
+  private static boolean isUnscheduledEncounter(Encounter encounter) {
+    EncounterType type = EncounterType.fromString(encounter.type);
+    return type == EncounterType.EMERGENCY || type == EncounterType.URGENTCARE;
+  }
+
+  /**
+   * Map the encounter's service type to a SNOMED coded concept.
+   * Uses the encounter's primary code when available, otherwise falls back
+   * to a generic "consultation" code.
+   *
+   * @param encounter the encounter to derive service type from
+   * @return CodeableConcept for the service type
+   */
+  private static CodeableConcept encounterServiceType(Encounter encounter) {
+    if (!encounter.codes.isEmpty()) {
+      return mapCodeToCodeableConcept(encounter.codes.get(0), SNOMED_URI);
+    }
+    // Wellness encounter - use a generic code
+    Code wellness = new Code(SNOMED_URI, "185349003", "Encounter for check up");
+    return mapCodeToCodeableConcept(wellness, SNOMED_URI);
+  }
+
+  /**
+   * Build a FHIR Reference to a Clinician (Practitioner). Works for both
+   * transaction bundles (search URL) and collection bundles (fullUrl lookup).
+   *
+   * @param clinician the clinician to reference
+   * @param bundle    the current bundle (for collection-mode lookup)
+   * @return a Reference to the Practitioner, or null if clinician is null
+   */
+  private static Reference clinicianReference(Clinician clinician, Bundle bundle) {
+    if (clinician == null) {
+      return null;
+    }
+    String display = clinician.getFullname();
+    if (TRANSACTION_BUNDLE) {
+      return new Reference(ExportHelper.buildFhirNpiSearchUrl(clinician))
+          .setDisplay(display);
+    } else {
+      String url = findPractitioner(clinician, bundle);
+      if (url != null) {
+        return new Reference(url).setDisplay(display);
+      }
+      BundleEntryComponent entry = practitioner(bundle, clinician);
+      return new Reference(entry.getFullUrl()).setDisplay(display);
+    }
+  }
+
+  /**
+   * Try to find a clinician with a nursing / admin specialty from the encounter's
+   * provider to act as the appointment scheduler. Falls back to the encounter
+   * clinician if no nurse is available.
+   *
+   * @param encounter the encounter
+   * @param person    the patient (used as RNG source)
+   * @return a Clinician who "scheduled" the appointment
+   */
+  private static Clinician findSchedulingClinician(Encounter encounter, Person person) {
+    Provider provider = encounter.provider;
+    if (provider == null) {
+      return encounter.clinician;
+    }
+    // Try nursing specialties first
+    String[] schedulerSpecialties = {
+        ClinicianSpecialty.NURSE_PRACTITIONER,
+        ClinicianSpecialty.CLINICAL_NURSE_SPECIALIST,
+        ClinicianSpecialty.CERTIFIED_NURSE_MIDWIFE,
+        ClinicianSpecialty.PHYSICIAN_ASSISTANT
+    };
+    for (String specialty : schedulerSpecialties) {
+      ArrayList<Clinician> nurses = provider.clinicianMap.get(specialty);
+      if (nurses != null && !nurses.isEmpty()) {
+        return nurses.get(person.randInt(nurses.size()));
+      }
+    }
+    // Fallback: use a different clinician from general practice if possible
+    ArrayList<Clinician> gps =
+        provider.clinicianMap.get(ClinicianSpecialty.GENERAL_PRACTICE);
+    if (gps != null && gps.size() > 1 && encounter.clinician != null) {
+      // Pick one who is NOT the encounter's clinician
+      for (Clinician c : gps) {
+        if (c.identifier != encounter.clinician.identifier) {
+          return c;
+        }
+      }
+    }
+    // Last resort: the encounter clinician scheduled it themselves
+    return encounter.clinician;
+  }
+
+  /**
+   * Try to find a referring practitioner for this encounter.
+   * For non-wellness encounters, the patient's primary care / wellness clinician
+   * is used as the referrer.
+   *
+   * @param encounter the encounter
+   * @param person    the patient
+   * @return the referring Clinician, or null if this is a wellness encounter
+   *         or no suitable referrer is found
+   */
+  private static Clinician findReferringClinician(Encounter encounter, Person person) {
+    EncounterType type = EncounterType.fromString(encounter.type);
+    if (type == EncounterType.WELLNESS) {
+      return null; // wellness visits don't have a referrer
+    }
+    // Get the patient's wellness / PCP provider
+    Provider wellnessProvider = person.getProvider(EncounterType.WELLNESS, encounter.start);
+    if (wellnessProvider == null || wellnessProvider.equals(encounter.provider)) {
+      return null; // same provider = no external referral
+    }
+    // Pick a GP clinician from the wellness provider
+    ArrayList<Clinician> gps =
+        wellnessProvider.clinicianMap.get(ClinicianSpecialty.GENERAL_PRACTICE);
+    if (gps != null && !gps.isEmpty()) {
+      return gps.get(person.randInt(gps.size()));
+    }
+    return null;
+  }
+
+  /**
+   * Create (or find) a PractitionerRole resource for the given clinician
+   * with their ACTUAL specialty. Emitted regardless of USE_US_CORE_IG.
+   *
+   * @param bundle    the bundle to add to
+   * @param clinician the clinician
+   * @return the PractitionerRole entry
+   */
+  private static BundleEntryComponent practitionerRoleWithSpecialty(
+      Bundle bundle, Clinician clinician) {
+    // Determine the real specialty
+    String specialty = (String) clinician.attributes.get(Clinician.SPECIALTY);
+    if (specialty == null) {
+      specialty = ClinicianSpecialty.GENERAL_PRACTICE;
+    }
+
+    // Deterministic UUID for this clinician's practitioner role
+    UUID origUUID = UUID.fromString(clinician.uuid);
+    String roleUuid = ExportHelper.buildUUID(origUUID.getLeastSignificantBits(),
+        origUUID.getMostSignificantBits(),
+        "PractitionerRole for Clinician " + origUUID);
+
+    // Check if we already created this PractitionerRole in this bundle
+    for (BundleEntryComponent entry : bundle.getEntry()) {
+      if (entry.getResource().fhirType().equals("PractitionerRole")
+          && entry.getResource().getId().equals(roleUuid)) {
+        return entry;
+      }
+    }
+
+    PractitionerRole practitionerRole = new PractitionerRole();
+
+    // Practitioner reference
+    practitionerRole.setPractitioner(new Reference()
+        .setIdentifier(new Identifier()
+            .setSystem("http://hl7.org/fhir/sid/us-npi")
+            .setValue(clinician.npi))
+        .setDisplay(clinician.getFullname()));
+
+    // Organization reference
+    if (clinician.getOrganization() != null) {
+      practitionerRole.setOrganization(new Reference()
+          .setIdentifier(new Identifier()
+              .setSystem(SYNTHEA_IDENTIFIER)
+              .setValue(clinician.getOrganization().getResourceID()))
+          .setDisplay(clinician.getOrganization().name));
+
+      // Location
+      practitionerRole.addLocation()
+          .setIdentifier(new Identifier()
+              .setSystem(SYNTHEA_IDENTIFIER)
+              .setValue(clinician.getOrganization().getResourceLocationID()))
+          .setDisplay(clinician.getOrganization().name);
+
+      // Telecom from organization
+      if (clinician.getOrganization().phone != null
+          && !clinician.getOrganization().phone.isEmpty()) {
+        practitionerRole.addTelecom(new ContactPoint()
+            .setSystem(ContactPointSystem.PHONE)
+            .setValue(clinician.getOrganization().phone));
+      }
+    }
+
+    // Use the clinician's REAL specialty
+    String cmsCode = ClinicianSpecialty.getCMSProviderSpecialtyCode(specialty);
+    if (cmsCode != null) {
+      practitionerRole.addCode(
+          mapCodeToCodeableConcept(
+              new Code("http://nucc.org/provider-taxonomy", cmsCode, specialty), null));
+      practitionerRole.addSpecialty(
+          mapCodeToCodeableConcept(
+              new Code("http://nucc.org/provider-taxonomy", cmsCode, specialty), null));
+    } else {
+      // Fallback: freetext specialty
+      CodeableConcept specConcept = new CodeableConcept();
+      specConcept.setText(specialty);
+      practitionerRole.addSpecialty(specConcept);
+    }
+
+    practitionerRole.setActive(true);
+    return newEntry(bundle, practitionerRole, roleUuid);
+  }
+
+  /**
+   * Create a Schedule resource representing the provider's schedule for the service type
+   * of this encounter. One Schedule is created per unique provider in the bundle.
+   *
+   * @param personEntry   The Patient entry
+   * @param bundle        The Bundle to add to
+   * @param encounterEntry The Encounter entry
+   * @param encounter     The source encounter
+   * @return The created Schedule entry
+   */
+  private static BundleEntryComponent schedule(BundleEntryComponent personEntry,
+      Bundle bundle, BundleEntryComponent encounterEntry, Encounter encounter) {
+    Schedule scheduleResource = new Schedule();
+
+    scheduleResource.setActive(true);
+
+    // Service type from encounter
+    scheduleResource.addServiceType(encounterServiceType(encounter));
+
+    // Link schedule to the provider and practitioner from the encounter
+    org.hl7.fhir.r4.model.Encounter encounterResource =
+        (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+
+    if (encounterResource.hasServiceProvider()) {
+      scheduleResource.addActor(encounterResource.getServiceProvider());
+    }
+
+    if (encounterResource.hasParticipant()) {
+      scheduleResource.addActor(
+          encounterResource.getParticipantFirstRep().getIndividual());
+    }
+
+    // Planning horizon covers the encounter period
+    if (encounterResource.hasPeriod()) {
+      scheduleResource.setPlanningHorizon(encounterResource.getPeriod());
+    }
+
+    scheduleResource.setComment("Auto-generated schedule for "
+        + encounterServiceType(encounter).getText());
+
+    // Use a deterministic UUID based on provider + encounter start to avoid duplicates
+    String scheduleId = UUID.nameUUIDFromBytes(
+        ("schedule-" + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, scheduleResource, scheduleId);
+  }
+
+  /**
+   * Create a Slot resource representing a bookable time window within the Schedule
+   * for this encounter. The slot covers the encounter's time period.
+   *
+   * @param bundle        The Bundle to add to
+   * @param scheduleEntry The Schedule entry this Slot belongs to
+   * @param encounter     The source encounter
+   * @return The created Slot entry
+   */
+  private static BundleEntryComponent slot(Bundle bundle,
+      BundleEntryComponent scheduleEntry, Encounter encounter) {
+    Slot slotResource = new Slot();
+
+    slotResource.setSchedule(new Reference(scheduleEntry.getFullUrl()));
+    slotResource.setStatus(SlotStatus.BUSY);
+
+    // Service type matches the schedule
+    slotResource.addServiceType(encounterServiceType(encounter));
+
+    slotResource.setStart(new Date(encounter.start));
+    slotResource.setEnd(new Date(encounter.stop));
+
+    String slotId = UUID.nameUUIDFromBytes(
+        ("slot-" + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, slotResource, slotId);
+  }
+
+  /**
+   * Create Appointment resource(s) with realistic lifecycle simulation.
+   * <p>
+   * Uses the Person's RNG to probabilistically determine the appointment status:
+   * ~80% fulfilled, ~8% cancelled (with a rescheduled replacement),
+   * ~5% noshow, ~5% booked, ~2% waitlisted.
+   * <p>
+   * Each appointment includes rich participant information:
+   * patient (SBJ), primary performer (PPRF), scheduler/nurse (ATND),
+   * referring practitioner (REF), and location.
+   * <p>
+   * For cancelled appointments, a second "rescheduled" appointment is also
+   * created 1-14 days later with status=fulfilled.
+   *
+   * @param person         The Person (for deterministic RNG)
+   * @param personEntry    The Patient entry
+   * @param bundle         The Bundle to add to
+   * @param encounterEntry The Encounter entry
+   * @param slotEntry      The Slot entry this Appointment refers to
+   * @param encounter      The source encounter
+   * @return The created Appointment entry (the final/active one)
+   */
+  private static BundleEntryComponent appointment(Person person,
+      BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry,
+      BundleEntryComponent slotEntry, Encounter encounter) {
+
+    // Determine appointment lifecycle status
+    double roll = person.rand();
+    AppointmentStatus status;
+    String cancelReason = null;
+    boolean createRescheduled = false;
+
+    if (roll < APPT_PROB_FULFILLED) {
+      status = AppointmentStatus.FULFILLED;
+    } else if (roll < APPT_PROB_CANCELLED) {
+      status = AppointmentStatus.CANCELLED;
+      cancelReason = person.rand() < 0.6 ? "pat" : "prov";
+      createRescheduled = true;
+    } else if (roll < APPT_PROB_NOSHOW) {
+      status = AppointmentStatus.NOSHOW;
+    } else if (roll < APPT_PROB_BOOKED) {
+      status = AppointmentStatus.BOOKED;
+    } else {
+      status = AppointmentStatus.WAITLIST;
+    }
+
+    // Find additional participants
+    Clinician scheduler = findSchedulingClinician(encounter, person);
+    Clinician referrer = findReferringClinician(encounter, person);
+
+    // Create PractitionerRole for the performing clinician (with real specialty)
+    if (encounter.clinician != null && shouldExport(PractitionerRole.class)) {
+      practitionerRoleWithSpecialty(bundle, encounter.clinician);
+    }
+    // Also create PractitionerRole for the scheduler if different
+    if (scheduler != null && scheduler != encounter.clinician
+        && shouldExport(PractitionerRole.class)) {
+      practitionerRoleWithSpecialty(bundle, scheduler);
+    }
+    // Also create PractitionerRole for the referrer if present
+    if (referrer != null && shouldExport(PractitionerRole.class)) {
+      practitionerRoleWithSpecialty(bundle, referrer);
+    }
+
+    // Build the primary appointment
+    BundleEntryComponent apptEntry = buildAppointmentResource(
+        person, personEntry, bundle, encounterEntry, slotEntry, encounter,
+        status, cancelReason, scheduler, referrer, "appointment-");
+
+    // For cancelled appointments, create a rescheduled replacement
+    if (createRescheduled) {
+      // Rescheduled appointment is 1-14 days later, status = fulfilled
+      long rescheduleDelayMs = (1 + person.randInt(14))
+          * 24L * 60L * 60L * 1000L;
+      // Temporarily shift the encounter times for the rescheduled appointment
+      long origStart = encounter.start;
+      long origStop = encounter.stop;
+      encounter.start = origStart + rescheduleDelayMs;
+      encounter.stop = origStop + rescheduleDelayMs;
+
+      // Create a new slot for the rescheduled time
+      BundleEntryComponent rescheduledSlotEntry = null;
+      if (shouldExport(Slot.class)) {
+        String reslotId = UUID.nameUUIDFromBytes(
+            ("slot-rescheduled-" + encounter.uuid.toString()).getBytes()).toString();
+        Slot reslot = new Slot();
+        reslot.setSchedule(
+            ((Slot) slotEntry.getResource()).getSchedule());
+        reslot.setStatus(SlotStatus.BUSY);
+        reslot.addServiceType(encounterServiceType(encounter));
+        reslot.setStart(new Date(encounter.start));
+        reslot.setEnd(new Date(encounter.stop));
+        rescheduledSlotEntry = newEntry(bundle, reslot, reslotId);
+      }
+
+      BundleEntryComponent rescheduledEntry = buildAppointmentResource(
+          person, personEntry, bundle, encounterEntry,
+          rescheduledSlotEntry != null ? rescheduledSlotEntry : slotEntry,
+          encounter, AppointmentStatus.FULFILLED,
+          null, scheduler, referrer, "appointment-rescheduled-");
+
+      // Restore original times
+      encounter.start = origStart;
+      encounter.stop = origStop;
+
+      return rescheduledEntry;
+    }
+
+    return apptEntry;
+  }
+
+  /**
+   * Build a single Appointment resource with all participant details.
+   *
+   * @param person          The Person (for RNG)
+   * @param personEntry     The Patient entry
+   * @param bundle          The Bundle
+   * @param encounterEntry  The Encounter entry
+   * @param slotEntry       The Slot entry
+   * @param encounter       The source Encounter
+   * @param status          The appointment status
+   * @param cancelReason    Cancellation reason code (null if not cancelled)
+   * @param scheduler       The clinician who scheduled the appointment
+   * @param referrer        The referring clinician (may be null)
+   * @param idPrefix        Prefix for the deterministic UUID
+   * @return the created Appointment entry
+   */
+  private static BundleEntryComponent buildAppointmentResource(
+      Person person, BundleEntryComponent personEntry, Bundle bundle,
+      BundleEntryComponent encounterEntry, BundleEntryComponent slotEntry,
+      Encounter encounter, AppointmentStatus status, String cancelReason,
+      Clinician scheduler, Clinician referrer, String idPrefix) {
+
+    Appointment appointmentResource = new Appointment();
+
+    appointmentResource.setStatus(status);
+
+    // Service type
+    appointmentResource.addServiceType(encounterServiceType(encounter));
+
+    // Reason from encounter
+    org.hl7.fhir.r4.model.Encounter encounterResource =
+        (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+    if (encounterResource.hasReasonCode()) {
+      appointmentResource.addReasonCode(encounterResource.getReasonCodeFirstRep());
+    }
+
+    // Timing
+    appointmentResource.setStart(new Date(encounter.start));
+    appointmentResource.setEnd(new Date(encounter.stop));
+    long durationMinutes = (encounter.stop - encounter.start) / (60 * 1000);
+    appointmentResource.setMinutesDuration((int) Math.max(durationMinutes, 1));
+
+    // Slot reference
+    if (slotEntry != null) {
+      appointmentResource.addSlot(new Reference(slotEntry.getFullUrl()));
+    }
+
+    // Cancellation reason
+    if (cancelReason != null) {
+      String display = cancelReason.equals("pat")
+          ? "Patient request" : "Provider request";
+      appointmentResource.setCancelationReason(
+          mapCodeToCodeableConcept(
+              new Code(CANCEL_REASON_SYSTEM, cancelReason, display),
+              CANCEL_REASON_SYSTEM));
+    }
+
+    // Created timestamp (booking was made some time before the appointment)
+    // Simulate booking 1-30 days before the appointment
+    long bookingLeadMs = (1 + person.randInt(30)) * 24L * 60L * 60L * 1000L;
+    long createdTime = Math.max(0, encounter.start - bookingLeadMs);
+    appointmentResource.setCreated(new Date(createdTime));
+
+    // Priority (1=ASAP, 5=routine, 9=low priority)
+    EncounterType encType = EncounterType.fromString(encounter.type);
+    if (encType == EncounterType.INPATIENT) {
+      appointmentResource.setPriority(3); // higher priority for inpatient
+    } else {
+      appointmentResource.setPriority(5); // routine
+    }
+
+    // Description
+    String desc = encounterServiceType(encounter).getText();
+    if (desc != null) {
+      appointmentResource.setDescription(desc);
+    }
+
+    // ---- Participants ----
+
+    // 1. Patient (SBJ = subject)
+    AppointmentParticipantComponent patientParticipant = appointmentResource.addParticipant();
+    patientParticipant.setActor(new Reference(personEntry.getFullUrl()));
+    patientParticipant.addType(mapCodeToCodeableConcept(
+        new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+            "SBJ", "subject"), null));
+    patientParticipant.setStatus(
+        status == AppointmentStatus.NOSHOW
+            ? ParticipationStatus.DECLINED : ParticipationStatus.ACCEPTED);
+    patientParticipant.setRequired(Appointment.ParticipantRequired.REQUIRED);
+
+    // 2. Primary performer (PPRF) - the encounter clinician / physician
+    if (encounter.clinician != null) {
+      AppointmentParticipantComponent practitionerParticipant =
+          appointmentResource.addParticipant();
+      practitionerParticipant.setActor(clinicianReference(encounter.clinician, bundle));
+      practitionerParticipant.addType(mapCodeToCodeableConcept(
+          new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+              "PPRF", "primary performer"), null));
+      practitionerParticipant.setStatus(ParticipationStatus.ACCEPTED);
+      practitionerParticipant.setRequired(Appointment.ParticipantRequired.REQUIRED);
+    }
+
+    // 3. Scheduler / nurse / admin staff (ATND = attender, who coordinated the appointment)
+    if (scheduler != null) {
+      AppointmentParticipantComponent schedulerParticipant =
+          appointmentResource.addParticipant();
+      schedulerParticipant.setActor(clinicianReference(scheduler, bundle));
+      schedulerParticipant.addType(mapCodeToCodeableConcept(
+          new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+              "ATND", "attender"), null));
+      schedulerParticipant.setStatus(ParticipationStatus.ACCEPTED);
+      schedulerParticipant.setRequired(Appointment.ParticipantRequired.INFORMATIONONLY);
+    }
+
+    // 4. Referring practitioner (REF) — only for non-wellness, external referrals
+    if (referrer != null) {
+      AppointmentParticipantComponent referrerParticipant =
+          appointmentResource.addParticipant();
+      referrerParticipant.setActor(clinicianReference(referrer, bundle));
+      referrerParticipant.addType(mapCodeToCodeableConcept(
+          new Code("http://terminology.hl7.org/CodeSystem/v3-ParticipationType",
+              "REF", "referrer"), null));
+      referrerParticipant.setStatus(ParticipationStatus.ACCEPTED);
+      referrerParticipant.setRequired(Appointment.ParticipantRequired.INFORMATIONONLY);
+    }
+
+    // 5. Location participant
+    if (encounterResource.hasLocation()) {
+      AppointmentParticipantComponent locationParticipant =
+          appointmentResource.addParticipant();
+      locationParticipant.setActor(
+          encounterResource.getLocationFirstRep().getLocation());
+      locationParticipant.setStatus(ParticipationStatus.ACCEPTED);
+      locationParticipant.setRequired(Appointment.ParticipantRequired.REQUIRED);
+    }
+
+    String appointmentId = UUID.nameUUIDFromBytes(
+        (idPrefix + encounter.uuid.toString()).getBytes()).toString();
+    return newEntry(bundle, appointmentResource, appointmentId);
+  }
+
+  /**
+   * Create a standalone ServiceRequest resource for a Procedure or ImagingStudy.
+   * This represents a clinical order that was placed and fulfilled during the encounter.
+   *
+   * @param personEntry    The Patient entry
+   * @param bundle         The Bundle to add to
+   * @param encounterEntry The Encounter entry
+   * @param encounter      The source encounter
+   * @param code           The code for the ordered service
+   * @param reasonCode     The reason for the order (may be null)
+   * @param orderedItemUuid UUID of the ordered item (Procedure or ImagingStudy)
+   * @param authoredOn     When the order was authored (millis since epoch)
+   * @return The created ServiceRequest entry
+   */
+  private static BundleEntryComponent serviceRequest(BundleEntryComponent personEntry,
+      Bundle bundle, BundleEntryComponent encounterEntry, Encounter encounter,
+      Code code, Code reasonCode, String orderedItemUuid, long authoredOn) {
+    ServiceRequest serviceRequestResource = new ServiceRequest();
+
+    serviceRequestResource.setStatus(ServiceRequest.ServiceRequestStatus.COMPLETED);
+    serviceRequestResource.setIntent(ServiceRequest.ServiceRequestIntent.ORDER);
+    serviceRequestResource.setSubject(new Reference(personEntry.getFullUrl()));
+    serviceRequestResource.setEncounter(new Reference(encounterEntry.getFullUrl()));
+
+    // Code for the requested service
+    serviceRequestResource.setCode(mapCodeToCodeableConcept(code, SNOMED_URI));
+
+    // When the order was placed
+    serviceRequestResource.setAuthoredOn(new Date(authoredOn));
+
+    // Requester - the encounter clinician
+    org.hl7.fhir.r4.model.Encounter encounterResource =
+        (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+    if (encounterResource.hasParticipant()) {
+      serviceRequestResource.setRequester(
+          encounterResource.getParticipantFirstRep().getIndividual());
+    }
+
+    // Performer - the provider organization
+    if (encounterResource.hasServiceProvider()) {
+      serviceRequestResource.addPerformer(encounterResource.getServiceProvider());
+    }
+
+    // Reason
+    if (reasonCode != null) {
+      serviceRequestResource.addReasonCode(mapCodeToCodeableConcept(reasonCode, SNOMED_URI));
+    }
+
+    // Category: procedure order
+    Code categoryCode = new Code("http://snomed.info/sct", "386053000",
+        "Evaluation procedure");
+    serviceRequestResource.addCategory(mapCodeToCodeableConcept(categoryCode, SNOMED_URI));
+
+    String serviceRequestId = UUID.nameUUIDFromBytes(
+        ("servicerequest-" + orderedItemUuid).getBytes()).toString();
+    return newEntry(bundle, serviceRequestResource, serviceRequestId);
+  }
+
+  /**
+   * Create a Task resource representing the fulfilment of a ServiceRequest.
+   * Tasks track the workflow status of clinical orders.
+   *
+   * @param personEntry          The Patient entry
+   * @param bundle               The Bundle to add to
+   * @param encounterEntry       The Encounter entry
+   * @param serviceRequestEntry  The ServiceRequest this Task fulfils
+   * @param encounter            The source encounter
+   * @param code                 The code describing the task
+   * @param taskStart            When the task started (millis since epoch)
+   * @param taskEnd              When the task ended (millis since epoch, 0 if ongoing)
+   * @return The created Task entry
+   */
+  private static BundleEntryComponent task(BundleEntryComponent personEntry,
+      Bundle bundle, BundleEntryComponent encounterEntry,
+      BundleEntryComponent serviceRequestEntry, Encounter encounter,
+      Code code, long taskStart, long taskEnd) {
+    Task taskResource = new Task();
+
+    // Status based on whether the task is completed
+    if (taskEnd != 0L) {
+      taskResource.setStatus(TaskStatus.COMPLETED);
+    } else {
+      taskResource.setStatus(TaskStatus.INPROGRESS);
+    }
+
+    taskResource.setIntent(TaskIntent.ORDER);
+
+    // Code
+    taskResource.setCode(mapCodeToCodeableConcept(code, SNOMED_URI));
+
+    // Description
+    taskResource.setDescription("Fulfil order: " + code.display);
+
+    // Patient
+    taskResource.setFor(new Reference(personEntry.getFullUrl()));
+
+    // Encounter
+    taskResource.setEncounter(new Reference(encounterEntry.getFullUrl()));
+
+    // Timing
+    taskResource.setAuthoredOn(new Date(taskStart));
+    Period executionPeriod = new Period().setStart(new Date(taskStart));
+    if (taskEnd != 0L) {
+      executionPeriod.setEnd(new Date(taskEnd));
+    }
+    taskResource.setExecutionPeriod(executionPeriod);
+
+    // Last modified
+    taskResource.setLastModified(taskEnd != 0L ? new Date(taskEnd) : new Date(taskStart));
+
+    // Requester and Owner from encounter
+    org.hl7.fhir.r4.model.Encounter encounterResource =
+        (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
+    if (encounterResource.hasParticipant()) {
+      taskResource.setRequester(encounterResource.getParticipantFirstRep().getIndividual());
+      taskResource.setOwner(encounterResource.getParticipantFirstRep().getIndividual());
+    }
+
+    // BasedOn - the ServiceRequest this task fulfils
+    taskResource.addBasedOn(new Reference(serviceRequestEntry.getFullUrl()));
+
+    // Focus - same ServiceRequest
+    taskResource.setFocus(new Reference(serviceRequestEntry.getFullUrl()));
+
+    String taskId = UUID.nameUUIDFromBytes(
+        ("task-" + serviceRequestEntry.getResource().getId()
+            + "-" + taskStart).getBytes()).toString();
+    return newEntry(bundle, taskResource, taskId);
   }
 
   /**
