@@ -1773,10 +1773,14 @@ public class FhirR4 {
         org.hl7.fhir.r4.model.Location location =
             (org.hl7.fhir.r4.model.Location) entry.getResource();
         Reference managingOrg = location.getManagingOrganization();
-        if (managingOrg != null
-            && managingOrg.hasIdentifier()
-            && managingOrg.getIdentifier().hasValue()
-            && managingOrg.getIdentifier().getValue().equals(provider.getResourceID())) {
+        if (managingOrg == null) {
+          continue;
+        }
+        String expectedReference = "Organization/" + provider.getResourceID();
+        if ((managingOrg.hasReference() && (managingOrg.getReference().equals(expectedReference)
+            || managingOrg.getReference().contains(provider.getResourceID())))
+            || (managingOrg.hasIdentifier() && managingOrg.getIdentifier().hasValue()
+                && managingOrg.getIdentifier().getValue().equals(provider.getResourceID()))) {
           return entry.getFullUrl();
         }
       }
@@ -3944,12 +3948,14 @@ public class FhirR4 {
     location.addIdentifier()
         .setSystem(SYNTHEA_IDENTIFIER)
         .setValue(provider.getResourceLocationID());
-    Identifier organizationIdentifier = new Identifier()
-        .setSystem(SYNTHEA_IDENTIFIER)
-        .setValue(provider.getResourceID());
-    location.setManagingOrganization(new Reference()
-        .setIdentifier(organizationIdentifier)
-        .setDisplay(provider.name));
+    String managingOrganizationReference = TRANSACTION_BUNDLE
+      ? ExportHelper.buildFhirSearchUrl("Organization", provider.getResourceID())
+      : findProviderUrl(provider, bundle);
+    if (managingOrganizationReference == null) {
+      managingOrganizationReference = "Organization/" + provider.getResourceID();
+    }
+    location.setManagingOrganization(new Reference(managingOrganizationReference)
+      .setDisplay(provider.name));
     return location;
   }
 
@@ -4333,9 +4339,16 @@ public class FhirR4 {
           dept.setPartOf(new Reference(hospLocUrl));
         }
       }
-      dept.setManagingOrganization(new Reference()
-          .setIdentifier(new Identifier()
-              .setSystem(SYNTHEA_IDENTIFIER).setValue(provId))
+      String managingOrganizationReference;
+      if (TRANSACTION_BUNDLE) {
+        managingOrganizationReference = ExportHelper.buildFhirSearchUrl("Organization", provId);
+      } else {
+        managingOrganizationReference = findProviderUrl(provider, bundle);
+        if (managingOrganizationReference == null) {
+          managingOrganizationReference = "Organization/" + provId;
+        }
+      }
+      dept.setManagingOrganization(new Reference(managingOrganizationReference)
           .setDisplay(provider.name));
       // Phone from provider
       if (provider.phone != null && !provider.phone.isEmpty()) {
