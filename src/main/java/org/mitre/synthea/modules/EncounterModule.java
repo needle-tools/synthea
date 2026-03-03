@@ -190,7 +190,7 @@ public final class EncounterModule extends Module {
       // Get the first provider in the list that was loaded
       prov = Provider.getProviderList().get(0);
     } else {
-      prov = person.getProvider(type, time);
+      prov = person.getProvider(type, specialty, time);
     }
     prov.incrementEncounters(type, year);
     encounter.provider = prov;

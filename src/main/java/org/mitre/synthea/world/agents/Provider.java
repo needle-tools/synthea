@@ -402,18 +402,57 @@ public class Provider implements QuadTreeElement, Serializable {
    * @return Service provider or null if none is available.
    */
   public static Provider findService(Person person, EncounterType service, long time) {
+    return findService(person, service, null, time);
+  }
+
+  /**
+   * Find specific service provider for the given person, optionally requiring a clinician
+   * specialty at the provider organization.
+   *
+   * @param person The patient who requires the service.
+   * @param service The service required. For example, EncounterType.AMBULATORY.
+   * @param specialty The clinician specialty required at the organization.
+   * @param time The date/time within the simulated world, in milliseconds.
+   * @return Service provider or null if none is available.
+   */
+  public static Provider findService(Person person, EncounterType service, String specialty, long time) {
     double maxDistance = MAX_PROVIDER_SEARCH_DISTANCE;
     double degrees = 0.125;
     List<Provider> options = null;
     Provider provider = null;
+
+    String requiredSpecialty = specialty;
+    if (requiredSpecialty != null && requiredSpecialty.trim().isEmpty()) {
+      requiredSpecialty = null;
+    }
+
     while (degrees <= maxDistance) {
       options = findProvidersByLocation(person, degrees);
+      if (requiredSpecialty != null) {
+        List<Provider> specialtyOptions = new ArrayList<Provider>();
+        for (Provider option : options) {
+          if (option != null && option.clinicianMap != null
+              && option.clinicianMap.containsKey(requiredSpecialty)) {
+            List<Clinician> clinicians = option.clinicianMap.get(requiredSpecialty);
+            if (clinicians != null && !clinicians.isEmpty()) {
+              specialtyOptions.add(option);
+            }
+          }
+        }
+        options = specialtyOptions;
+      }
+
       provider = providerFinder.find(options, person, service, time);
       if (provider != null) {
         return provider;
       }
       degrees *= 2.0;
     }
+
+    if (requiredSpecialty != null) {
+      return findService(person, service, time);
+    }
+
     return null;
   }
 
@@ -519,6 +558,8 @@ public class Provider implements QuadTreeElement, Serializable {
                 false);
 
         servicesProvided.clear();
+        servicesProvided.add(EncounterType.AMBULATORY);
+        servicesProvided.add(EncounterType.OUTPATIENT);
         servicesProvided.add(EncounterType.WELLNESS);
         String primaryCareFile = Config.get("generate.providers.primarycare.default_file");
         loadProviders(location, primaryCareFile, ProviderType.PRIMARY, servicesProvided,

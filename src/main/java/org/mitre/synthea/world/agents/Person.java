@@ -784,6 +784,13 @@ public class Person implements Serializable, RandomNumberGenerator, QuadTreeElem
   /** The preferred provider key */
   public static final String PREFERREDYPROVIDER = "preferredProvider";
 
+  private static String providerKey(EncounterType type, String specialty) {
+    if (specialty == null || specialty.trim().isEmpty()) {
+      return PREFERREDYPROVIDER + type;
+    }
+    return PREFERREDYPROVIDER + type + "|" + specialty;
+  }
+
   /**
    * Get the preferred provider for the specified encounter type. If none is set the
    * provider at the specified time as the preferred provider for this encounter type.
@@ -793,9 +800,21 @@ public class Person implements Serializable, RandomNumberGenerator, QuadTreeElem
    * @return The preferred provider.
    */
   public Provider getProvider(EncounterType type, long time) {
-    String key = PREFERREDYPROVIDER + type;
+    return getProvider(type, null, time);
+  }
+
+  /**
+   * Get the preferred provider for the specified encounter type and clinician specialty.
+   *
+   * @param type The type of encounter.
+   * @param specialty The clinician specialty required for this encounter.
+   * @param time The time of the encounter.
+   * @return The preferred provider.
+   */
+  public Provider getProvider(EncounterType type, String specialty, long time) {
+    String key = providerKey(type, specialty);
     if (!attributes.containsKey(key)) {
-      setProvider(type, time);
+      setProvider(type, specialty, time);
     } else {
       Entity entity = (Entity) attributes.get(ENTITY);
       // check to see if this is a fixed identity
@@ -808,7 +827,7 @@ public class Person implements Serializable, RandomNumberGenerator, QuadTreeElem
             && !entity.seedAt(time).getPeriod().contains(lastEncounterTime)) {
           // The provider is not in the seed range. Force finding a new provider.
           System.out.println("Move reset for " + type);
-          setProvider(type, time);
+          setProvider(type, specialty, time);
         }
       }
     }
@@ -822,10 +841,21 @@ public class Person implements Serializable, RandomNumberGenerator, QuadTreeElem
    * @param provider The provider to set as preferred.
    */
   public void setProvider(EncounterType type, Provider provider) {
+    setProvider(type, null, provider);
+  }
+
+  /**
+   * Set the preferred provider for the specified encounter type and specialty.
+   *
+   * @param type The type of encounter.
+   * @param specialty The clinician specialty required for this encounter.
+   * @param provider The provider to set as preferred.
+   */
+  public void setProvider(EncounterType type, String specialty, Provider provider) {
     if (provider == null) {
       throw new RuntimeException("Unable to find provider: " + type);
     }
-    String key = PREFERREDYPROVIDER + type;
+    String key = providerKey(type, specialty);
     attributes.put(key, provider);
   }
 
@@ -837,12 +867,27 @@ public class Person implements Serializable, RandomNumberGenerator, QuadTreeElem
    * @param time The time of the encounter.
    */
   public void setProvider(EncounterType type, long time) {
-    Provider provider = Provider.findService(this, type, time);
+    setProvider(type, null, time);
+  }
+
+  /**
+   * Set the preferred provider for the specified encounter type and specialty to be the provider
+   * at the specified time.
+   *
+   * @param type The type of encounter.
+   * @param specialty The clinician specialty required for this encounter.
+   * @param time The time of the encounter.
+   */
+  public void setProvider(EncounterType type, String specialty, long time) {
+    Provider provider = Provider.findService(this, type, specialty, time);
+    if (provider == null && specialty != null && !specialty.trim().isEmpty()) {
+      provider = Provider.findService(this, type, time);
+    }
     if (provider == null && Provider.USE_HOSPITAL_AS_DEFAULT) {
       // Default to Hospital
       provider = Provider.findService(this, EncounterType.INPATIENT, time);
     }
-    setProvider(type, provider);
+    setProvider(type, specialty, provider);
   }
 
   /**
