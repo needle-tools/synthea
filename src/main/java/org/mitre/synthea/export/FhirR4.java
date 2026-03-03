@@ -265,6 +265,15 @@ public class FhirR4 {
   }
 
   private static final String COUNTRY_CODE = Config.get("generate.geography.country_code");
+    private static final String CAREPLAN_CATEGORY_SYSTEM = Config.get(
+      "exporter.fhir.careplan.category.system",
+      "US".equalsIgnoreCase(COUNTRY_CODE)
+        ? "http://hl7.org/fhir/us/core/CodeSystem/careplan-category"
+        : "http://terminology.hl7.org/CodeSystem/care-plan-category");
+    private static final boolean NORMALIZE_PHONE_FOR_COUNTRY = Config.getAsBoolean(
+      "exporter.fhir.normalize_phone_for_country", true);
+    private static final String NON_US_FALLBACK_PHONE = Config.get(
+      "exporter.fhir.non_us_fallback_phone", "+49 345 000000");
   private static final String PASSPORT_URI = Config.get("generate.geography.passport_uri", "http://hl7.org/fhir/sid/passport-USA");
 
   private static final HashSet<Class<? extends Resource>> includedResources = new HashSet<>();
@@ -1259,11 +1268,13 @@ public class FhirR4 {
         .setSystem("http://hospital.smarthealthit.org")
         .setValue((String) person.attributes.get(Person.ID));
 
-    Code ssnCode = new Code("http://terminology.hl7.org/CodeSystem/v2-0203", "SS", "Social Security Number");
-    patientResource.addIdentifier()
+    if ("US".equalsIgnoreCase(COUNTRY_CODE)) {
+      Code ssnCode = new Code("http://terminology.hl7.org/CodeSystem/v2-0203", "SS", "Social Security Number");
+      patientResource.addIdentifier()
         .setType(mapCodeToCodeableConcept(ssnCode, "http://terminology.hl7.org/CodeSystem/v2-0203"))
         .setSystem("http://hl7.org/fhir/sid/us-ssn")
         .setValue((String) person.attributes.get(Person.IDENTIFIER_SSN));
+    }
 
     if (person.attributes.get(Person.IDENTIFIER_DRIVERS) != null) {
       Code driversCode = new Code("http://terminology.hl7.org/CodeSystem/v2-0203", "DL", "Driver's license number");
@@ -1482,7 +1493,7 @@ public class FhirR4 {
 
     patientResource.addTelecom().setSystem(ContactPointSystem.PHONE)
         .setUse(ContactPointUse.HOME)
-        .setValue((String) person.attributes.get(Person.TELECOM));
+      .setValue(normalizePhoneForCountry((String) person.attributes.get(Person.TELECOM)));
 
     String maritalStatus = ((String) person.attributes.get(Person.MARITAL_STATUS));
     if (maritalStatus != null) {
@@ -3382,7 +3393,7 @@ public class FhirR4 {
           "http://hl7.org/fhir/us/core/StructureDefinition/us-core-careplan");
       careplanResource.setMeta(meta);
       careplanResource.addCategory(mapCodeToCodeableConcept(
-          new Code("http://hl7.org/fhir/us/core/CodeSystem/careplan-category", "assess-plan",
+          new Code(CAREPLAN_CATEGORY_SYSTEM, "assess-plan",
               null), null));
     }
 
@@ -3654,6 +3665,23 @@ public class FhirR4 {
     identifier.setSystem("urn:ietf:rfc:3986");
     identifier.setValue("urn:oid:" + uid);
     return identifier;
+  }
+
+  private static String normalizePhoneForCountry(String phone) {
+    if (phone == null) {
+      return null;
+    }
+    if (!NORMALIZE_PHONE_FOR_COUNTRY) {
+      return phone;
+    }
+    if ("US".equalsIgnoreCase(COUNTRY_CODE)) {
+      return phone;
+    }
+    String trimmed = phone.trim();
+    if (trimmed.startsWith("(555)") || trimmed.startsWith("555-")) {
+      return NON_US_FALLBACK_PHONE;
+    }
+    return trimmed;
   }
 
   /**
@@ -4704,7 +4732,7 @@ public class FhirR4 {
     carePlan.setEncounter(new Reference(encounterEntry.getFullUrl()));
 
     carePlan.addCategory(new CodeableConcept().addCoding(new Coding(
-        "http://hl7.org/fhir/us/core/CodeSystem/careplan-category",
+      CAREPLAN_CATEGORY_SYSTEM,
         "assess-plan", "Assessment and Plan of Treatment")));
 
     // Medication schedule category
