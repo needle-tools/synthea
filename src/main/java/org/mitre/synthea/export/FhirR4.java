@@ -1734,6 +1734,59 @@ public class FhirR4 {
   }
 
   /**
+   * Find provider Organization entry in the current bundle.
+   *
+   * @param provider A given provider.
+   * @param bundle   The current bundle being generated.
+   * @return Matching Organization entry if found, otherwise null.
+   */
+  private static BundleEntryComponent findProviderEntry(Provider provider, Bundle bundle) {
+    if (provider == null) {
+      return null;
+    }
+    for (BundleEntryComponent entry : bundle.getEntry()) {
+      if (!(entry.getResource() instanceof Organization)) {
+        continue;
+      }
+      Organization org = (Organization) entry.getResource();
+      if (!org.hasIdentifier() || !org.getIdentifierFirstRep().hasValue()) {
+        continue;
+      }
+      if (provider.getResourceID().equals(org.getIdentifierFirstRep().getValue())) {
+        return entry;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Find provider Location entry by stable Synthea identifier.
+   *
+   * @param provider A given provider.
+   * @param bundle   The current bundle being generated.
+   * @return Matching Location entry if found, otherwise null.
+   */
+  private static BundleEntryComponent findProviderLocationEntry(Provider provider, Bundle bundle) {
+    if (provider == null) {
+      return null;
+    }
+    String expectedLocationId = provider.getResourceLocationID();
+    for (BundleEntryComponent entry : bundle.getEntry()) {
+      if (!(entry.getResource() instanceof org.hl7.fhir.r4.model.Location)) {
+        continue;
+      }
+      org.hl7.fhir.r4.model.Location location =
+          (org.hl7.fhir.r4.model.Location) entry.getResource();
+      for (Identifier identifier : location.getIdentifier()) {
+        if (identifier.hasValue() && expectedLocationId.equals(identifier.getValue())) {
+          return entry;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
    * Finds the "patient's home" Location resource and returns the URL. If it does not yet exist in
    * the bundle, it will create it.
    * @param bundle the bundle to look in for the patient home resource
@@ -3840,6 +3893,17 @@ public class FhirR4 {
    */
   protected static BundleEntryComponent provider(Bundle bundle,
           Provider provider) {
+    BundleEntryComponent existingProvider = findProviderEntry(provider, bundle);
+    if (existingProvider != null) {
+      if (USE_US_CORE_IG && findProviderLocationEntry(provider, bundle) == null) {
+        org.hl7.fhir.r4.model.Location location = providerLocation(bundle, provider);
+        if (location != null) {
+          newEntry(bundle, location, provider.getResourceLocationID());
+        }
+      }
+      return existingProvider;
+    }
+
     Organization organizationResource = new Organization();
     if (USE_US_CORE_IG) {
       Meta meta = new Meta();
