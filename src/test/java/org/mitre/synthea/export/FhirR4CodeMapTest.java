@@ -2,12 +2,14 @@ package org.mitre.synthea.export;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
 
 import org.hl7.fhir.r4.model.Bundle;
 import org.hl7.fhir.r4.model.Bundle.BundleEntryComponent;
 import org.hl7.fhir.r4.model.Coding;
+import org.hl7.fhir.r4.model.PractitionerRole;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -96,13 +98,34 @@ public class FhirR4CodeMapTest {
     assertEquals("http://hl7.org/fhir/sid/icd-10-cm", translation.getSystem());
   }
 
-  /**
-   * Export a person with a single encounter whose reason is a code the test code map
-   * knows about, and return the translated coding that was added to that reason.
-   *
-   * @return the translated coding, or null if no translation was added
-   */
-  private Coding translationOfEncounterReason() {
+  @Test
+  public void testPractitionerRolesKeepCmsSpecialtyIdentity() {
+    String[][] specialties = {
+        {ClinicianSpecialty.GENERAL_PRACTICE, "01"},
+        {ClinicianSpecialty.MEDICAL_ONCOLOGY, "90"},
+        {ClinicianSpecialty.NURSE_PRACTITIONER, "50"}
+    };
+    for (String[] specialty : specialties) {
+      int roles = 0;
+      for (BundleEntryComponent entry : bundleForSpecialty(specialty[0]).getEntry()) {
+        if (!(entry.getResource() instanceof PractitionerRole)) {
+          continue;
+        }
+        PractitionerRole role = (PractitionerRole) entry.getResource();
+        roles++;
+        for (Coding coding : new Coding[] {role.getCodeFirstRep().getCodingFirstRep(),
+            role.getSpecialtyFirstRep().getCodingFirstRep()}) {
+          assertEquals("https://bluebutton.cms.gov/resources/variables/prvdr_spclty",
+              coding.getSystem());
+          assertEquals(specialty[1], coding.getCode());
+          assertEquals(specialty[0], coding.getDisplay());
+        }
+      }
+      assertTrue("Export must contain a role for " + specialty[0], roles > 0);
+    }
+  }
+
+  private Bundle bundleForSpecialty(String specialty) {
     Person person = new Person(0L);
     person.attributes.put(Person.RACE, "dummy value to prevent NPE");
     person.attributes.put(Person.ETHNICITY, "dummy value to prevent NPE");
@@ -115,6 +138,7 @@ public class FhirR4CodeMapTest {
     stub.name = "Fake Provider";
     stub.npi = "0";
     Clinician doc = new Clinician(0, person, 0, stub);
+    doc.attributes.put(Clinician.SPECIALTY, specialty);
     ArrayList<Clinician> docs = new ArrayList<Clinician>();
     docs.add(doc);
     stub.clinicianMap.put(ClinicianSpecialty.GENERAL_PRACTICE, docs);
@@ -124,10 +148,15 @@ public class FhirR4CodeMapTest {
 
     HealthRecord.Encounter encounter = person.record.encounterStart(0, EncounterType.AMBULATORY);
     encounter.provider = person.record.provider;
+    encounter.clinician = doc;
     encounter.reason = new Code("SNOMED-CT", "10509002", "Acute bronchitis (disorder)");
 
-    Bundle bundle = FhirR4.convertToFHIR(person, 0);
+    return FhirR4.convertToFHIR(person, 0);
+  }
 
+  /** Return the configured translation emitted for an encounter reason. */
+  private Coding translationOfEncounterReason() {
+    Bundle bundle = bundleForSpecialty(ClinicianSpecialty.GENERAL_PRACTICE);
     for (BundleEntryComponent entry : bundle.getEntry()) {
       if (entry.getResource() instanceof org.hl7.fhir.r4.model.Encounter) {
         org.hl7.fhir.r4.model.Encounter resource =

@@ -195,6 +195,8 @@ public class FhirR4 {
   private static final String SYNTHEA_EXT = "http://synthetichealth.github.io/synthea/";
   private static final String UNITSOFMEASURE_URI = "http://unitsofmeasure.org";
   private static final String DICOM_DCM_URI = "http://dicom.nema.org/resources/ontology/DCM";
+  private static final String CMS_SPECIALTY_URI =
+      "https://bluebutton.cms.gov/resources/variables/prvdr_spclty";
   private static final String MEDIA_TYPE_URI = "http://terminology.hl7.org/CodeSystem/media-type";
   protected static final String SYNTHEA_IDENTIFIER = "https://github.com/synthetichealth/synthea";
 
@@ -5495,15 +5497,15 @@ public class FhirR4 {
       }
     }
 
-    // Use the clinician's REAL specialty
+    // ClinicianSpecialty supplies CMS billing codes, in the CMS R4 namespace.
     String cmsCode = ClinicianSpecialty.getCMSProviderSpecialtyCode(specialty);
     if (cmsCode != null) {
       practitionerRole.addCode(
           mapCodeToCodeableConcept(
-              new Code("http://nucc.org/provider-taxonomy", cmsCode, specialty), null));
+              new Code(CMS_SPECIALTY_URI, cmsCode, specialty), null));
       practitionerRole.addSpecialty(
           mapCodeToCodeableConcept(
-              new Code("http://nucc.org/provider-taxonomy", cmsCode, specialty), null));
+              new Code(CMS_SPECIALTY_URI, cmsCode, specialty), null));
     } else {
       // Fallback: freetext specialty
       CodeableConcept specConcept = new CodeableConcept();
