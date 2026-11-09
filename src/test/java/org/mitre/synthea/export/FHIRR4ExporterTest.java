@@ -28,6 +28,11 @@ import org.hl7.fhir.r4.model.Media;
 import org.hl7.fhir.r4.model.Observation;
 import org.hl7.fhir.r4.model.Quantity;
 import org.hl7.fhir.r4.model.SampledData;
+import org.hl7.fhir.r4.model.Schedule;
+import org.hl7.fhir.r4.model.CarePlan;
+import org.hl7.fhir.r4.model.CommunicationRequest;
+import org.hl7.fhir.r4.model.Appointment;
+import org.hl7.fhir.r4.model.MedicationRequest;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Rule;
@@ -457,6 +462,105 @@ public class FHIRR4ExporterTest {
     assertTrue(FhirR4.shouldExport(org.hl7.fhir.r4.model.MedicationRequest.class));
     assertTrue(FhirR4.shouldExport(org.hl7.fhir.r4.model.Procedure.class));
     assertTrue(FhirR4.shouldExport(org.hl7.fhir.r4.model.Condition.class));
+  }
+
+  @Test
+  public void testSchedulingAndMedicationReferences() throws Exception {
+    assertEquals("http://dicom.nema.org/resources/ontology/DCM",
+        ExportHelper.getSystemURI("DICOM-DCM"));
+    TestHelper.loadTestProperties();
+    Config.set("exporter.fhir.included_resources", "");
+    Config.set("exporter.fhir.excluded_resources", "");
+    FhirR4.reloadIncludeExclude();
+    FhirR4.USE_US_CORE_IG = false;
+    FhirR4.TRANSACTION_BUNDLE = false;
+    Person person = new Person(42L);
+    person.attributes.put(Person.RACE, "white");
+    person.attributes.put(Person.ETHNICITY, "nonhispanic");
+    person.attributes.put(Person.FIRST_LANGUAGE, "english");
+    person.attributes.put(Person.BIRTHDATE, 0L);
+    person.attributes.put(Person.GENDER, "F");
+    person.coverage.setPlanToNoInsurance(0L);
+    Provider provider = new Provider();
+    provider.name = "Synthetic Clinic";
+    provider.npi = "0";
+    Clinician clinician = new Clinician(0, person, 0, provider);
+    clinician.attributes.put(Person.GENDER, "F");
+    provider.clinicianMap.put(ClinicianSpecialty.GENERAL_PRACTICE,
+        new ArrayList<>(List.of(clinician)));
+    person.record.provider = provider;
+    person.setProvider(EncounterType.WELLNESS, provider);
+    long first = Utilities.convertTime("years", 40);
+    for (int index = 0; index < 20; index++) {
+      long start = first + Utilities.convertTime("days", index * 30);
+      while (person.coverage.newEnrollmentPeriod(start)) {
+        // Advance the synthetic insurance enrollment calendar to this encounter.
+      }
+      person.coverage.setPlanToNoInsurance(start);
+      HealthRecord.Encounter encounter = person.record.encounterStart(start, EncounterType.WELLNESS);
+      encounter.provider = provider;
+      encounter.clinician = clinician;
+      encounter.codes.add(new Code("SNOMED-CT", "185349003", "Encounter for check up"));
+      person.record.medicationStart(start, "Synthetic medication " + index, true)
+          .codes.add(new Code("RxNorm", "197361", "Amlodipine 5 MG Oral Tablet"));
+      person.record.encounterEnd(start + Utilities.convertTime("minutes", 15),
+          EncounterType.WELLNESS);
+    }
+    Bundle bundle = FhirR4.convertToFHIR(person, first + Utilities.convertTime("years", 2));
+    Map<String, org.hl7.fhir.r4.model.Resource> resources = bundle.getEntry().stream()
+        .collect(Collectors.toMap(BundleEntryComponent::getFullUrl, BundleEntryComponent::getResource));
+    int schedules = 0;
+    int reminders = 0;
+    int medicationPlans = 0;
+    int cancellations = 0;
+    for (var resource : resources.values()) {
+      if (resource instanceof Schedule) {
+        schedules++;
+        for (var actor : ((Schedule) resource).getActor()) {
+          var target = resources.get(actor.getReference());
+          assertTrue(target != null);
+          assertTrue(Set.of("Patient", "Practitioner", "PractitionerRole", "RelatedPerson",
+              "Device", "HealthcareService", "Location").contains(target.fhirType()));
+        }
+        assertTrue(((Schedule) resource).hasActor());
+      } else if (resource instanceof CommunicationRequest) {
+        for (var medium : ((CommunicationRequest) resource).getMedium()) {
+          for (var coding : medium.getCoding()) {
+            if ("SMSWRIT".equals(coding.getCode())) {
+              reminders++;
+              assertEquals("SMS message", coding.getDisplay());
+            }
+          }
+        }
+      } else if (resource instanceof Appointment) {
+        var appointment = (Appointment) resource;
+        if (appointment.hasCancelationReason()) {
+          cancellations++;
+          var coding = appointment.getCancelationReason().getCodingFirstRep();
+          assertEquals("pat".equals(coding.getCode()) ? "Patient" : "Provider",
+              coding.getDisplay());
+        }
+      } else if (resource instanceof CarePlan) {
+        var plan = (CarePlan) resource;
+        if ("Medikationsplan".equals(plan.getTitle())) {
+          medicationPlans++;
+          assertEquals("http://hl7.org/fhir/us/core/CodeSystem/careplan-category",
+              plan.getCategoryFirstRep().getCodingFirstRep().getSystem());
+          for (var activity : plan.getActivity()) {
+            assertTrue(activity.hasReference());
+            assertEquals(Set.of("reference"), activity.children().stream()
+                .filter(property -> property.hasValues())
+                .map(property -> property.getName()).collect(Collectors.toSet()));
+            assertTrue(resources.get(activity.getReference().getReference())
+                instanceof MedicationRequest);
+          }
+        }
+      }
+    }
+    assertEquals(20, schedules);
+    assertEquals(20, medicationPlans);
+    assertTrue(reminders > 0);
+    assertTrue(cancellations > 0);
   }
 
   @Test

@@ -266,11 +266,9 @@ public class FhirR4 {
   }
 
   private static final String COUNTRY_CODE = Config.get("generate.geography.country_code");
-    private static final String CAREPLAN_CATEGORY_SYSTEM = Config.get(
+  private static final String CAREPLAN_CATEGORY_SYSTEM = Config.get(
       "exporter.fhir.careplan.category.system",
-      "US".equalsIgnoreCase(COUNTRY_CODE)
-        ? "http://hl7.org/fhir/us/core/CodeSystem/careplan-category"
-        : "http://terminology.hl7.org/CodeSystem/care-plan-category");
+      "http://hl7.org/fhir/us/core/CodeSystem/careplan-category");
     private static final boolean NORMALIZE_PHONE_FOR_COUNTRY = Config.getAsBoolean(
       "exporter.fhir.normalize_phone_for_country", true);
     private static final String NON_US_FALLBACK_PHONE = Config.get(
@@ -546,7 +544,7 @@ public class FhirR4 {
       if (!encounter.medications.isEmpty()
           && shouldExport(org.hl7.fhir.r4.model.CarePlan.class)) {
         medicationCarePlan(personEntry, bundle, encounterEntry, encounter,
-            encounter.medications);
+            encounter.medications, medReqEntries);
       }
 
       // Nurse handover task board (medications, labs, shift handoff)
@@ -1008,7 +1006,7 @@ public class FhirR4 {
 
           // Cancellation reason
           String crDisplay = "pat".equals(cancelReason)
-              ? "Patient request" : "Provider request";
+              ? "Patient" : "Provider";
           cancelledAppt.setCancelationReason(
               mapCodeToCodeableConcept(
                   new Code(CANCEL_REASON_SYSTEM, cancelReason, crDisplay),
@@ -4076,9 +4074,9 @@ public class FhirR4 {
     }
     practitionerResource.addAddress(address);
 
-    if (clinician.attributes.get(Person.GENDER).equals("M")) {
+    if ("M".equals(clinician.attributes.get(Person.GENDER))) {
       practitionerResource.setGender(AdministrativeGender.MALE);
-    } else if (clinician.attributes.get(Person.GENDER).equals("F")) {
+    } else if ("F".equals(clinician.attributes.get(Person.GENDER))) {
       practitionerResource.setGender(AdministrativeGender.FEMALE);
     }
     BundleEntryComponent practitionerEntry =
@@ -4565,7 +4563,7 @@ public class FhirR4 {
     // Medium: phone or SMS
     commReq.addMedium(new CodeableConcept().addCoding(new Coding(
       "http://terminology.hl7.org/CodeSystem/v3-ParticipationMode",
-      "SMSWRIT", "SMS")));
+      "SMSWRIT", "SMS message")));
 
     commReq.setSubject(new Reference(personEntry.getFullUrl()));
     commReq.addAbout(new Reference(apptEntry.getFullUrl()));
@@ -4634,7 +4632,7 @@ public class FhirR4 {
 
     commReq.addMedium(new CodeableConcept().addCoding(new Coding(
       "http://terminology.hl7.org/CodeSystem/v3-ParticipationMode",
-      "SMSWRIT", "SMS")));
+      "SMSWRIT", "SMS message")));
 
     commReq.setSubject(new Reference(personEntry.getFullUrl()));
     commReq.addAbout(new Reference(medReqEntry.getFullUrl()));
@@ -4808,12 +4806,13 @@ public class FhirR4 {
    * @param encounterEntry Encounter entry
    * @param encounter     The encounter
    * @param medications   Active medications from this encounter
+   * @param requests      Exported medication orders, in medication order
    * @return The CarePlan entry
    */
   private static BundleEntryComponent medicationCarePlan(
       BundleEntryComponent personEntry, Bundle bundle,
       BundleEntryComponent encounterEntry, Encounter encounter,
-      List<Medication> medications) {
+      List<Medication> medications, List<BundleEntryComponent> requests) {
 
     org.hl7.fhir.r4.model.CarePlan carePlan = new org.hl7.fhir.r4.model.CarePlan();
     carePlan.setStatus(CarePlanStatus.ACTIVE);
@@ -4835,9 +4834,17 @@ public class FhirR4 {
         .setStart(new Date(encounter.start))
         .setEnd(encounter.stop != 0L ? new Date(encounter.stop) : null));
 
-    for (Medication med : medications) {
+    for (int index = 0; index < medications.size(); index++) {
+      Medication med = medications.get(index);
       Code medCode = med.codes.get(0);
       CarePlanActivityComponent activity = carePlan.addActivity();
+
+      // cpl-3: the exported order owns medication and dosage details. Inline
+      // activities are used only when MedicationRequest export is disabled.
+      if (!requests.isEmpty()) {
+        activity.setReference(new Reference(requests.get(index).getFullUrl()));
+        continue;
+      }
 
       CarePlanActivityDetailComponent detail = activity.getDetail();
       detail.setStatus(med.stop != 0L && med.stop < encounter.stop
@@ -5527,17 +5534,24 @@ public class FhirR4 {
     // Service type from encounter
     scheduleResource.addServiceType(encounterServiceType(encounter));
 
-    // Link schedule to the provider and practitioner from the encounter
+    // Availability belongs to the encounter's locations and practitioners.
+    // R4 Schedule.actor does not permit an Organization.
     org.hl7.fhir.r4.model.Encounter encounterResource =
         (org.hl7.fhir.r4.model.Encounter) encounterEntry.getResource();
 
-    if (encounterResource.hasServiceProvider()) {
-      scheduleResource.addActor(encounterResource.getServiceProvider());
+    for (var location : encounterResource.getLocation()) {
+      if (location.hasLocation()) {
+        scheduleResource.addActor(location.getLocation().copy());
+      }
     }
 
-    if (encounterResource.hasParticipant()) {
-      scheduleResource.addActor(
-          encounterResource.getParticipantFirstRep().getIndividual());
+    for (var participant : encounterResource.getParticipant()) {
+      if (participant.hasIndividual()) {
+        scheduleResource.addActor(participant.getIndividual().copy());
+      }
+    }
+    if (!scheduleResource.hasActor()) {
+      scheduleResource.addActor(new Reference(personEntry.getFullUrl()));
     }
 
     // Planning horizon covers the encounter period
@@ -5743,7 +5757,7 @@ public class FhirR4 {
     // Cancellation reason
     if (cancelReason != null) {
       String display = cancelReason.equals("pat")
-          ? "Patient request" : "Provider request";
+          ? "Patient" : "Provider";
       appointmentResource.setCancelationReason(
           mapCodeToCodeableConcept(
               new Code(CANCEL_REASON_SYSTEM, cancelReason, display),
