@@ -30,6 +30,7 @@ import org.hl7.fhir.r4.model.Quantity;
 import org.hl7.fhir.r4.model.SampledData;
 import org.hl7.fhir.r4.model.Schedule;
 import org.hl7.fhir.r4.model.CarePlan;
+import org.hl7.fhir.r4.model.CareTeam;
 import org.hl7.fhir.r4.model.CommunicationRequest;
 import org.hl7.fhir.r4.model.Appointment;
 import org.hl7.fhir.r4.model.MedicationRequest;
@@ -490,6 +491,7 @@ public class FHIRR4ExporterTest {
         new ArrayList<>(List.of(clinician)));
     person.record.provider = provider;
     person.setProvider(EncounterType.WELLNESS, provider);
+    person.setProvider(EncounterType.INPATIENT, provider);
     long first = Utilities.convertTime("years", 40);
     for (int index = 0; index < 20; index++) {
       long start = first + Utilities.convertTime("days", index * 30);
@@ -497,14 +499,15 @@ public class FHIRR4ExporterTest {
         // Advance the synthetic insurance enrollment calendar to this encounter.
       }
       person.coverage.setPlanToNoInsurance(start);
-      HealthRecord.Encounter encounter = person.record.encounterStart(start, EncounterType.WELLNESS);
+      EncounterType encounterType = index == 0 ? EncounterType.INPATIENT : EncounterType.WELLNESS;
+      HealthRecord.Encounter encounter = person.record.encounterStart(start, encounterType);
       encounter.provider = provider;
       encounter.clinician = clinician;
       encounter.codes.add(new Code("SNOMED-CT", "185349003", "Encounter for check up"));
       person.record.medicationStart(start, "Synthetic medication " + index, true)
           .codes.add(new Code("RxNorm", "197361", "Amlodipine 5 MG Oral Tablet"));
       person.record.encounterEnd(start + Utilities.convertTime("minutes", 15),
-          EncounterType.WELLNESS);
+          encounterType);
     }
     Bundle bundle = FhirR4.convertToFHIR(person, first + Utilities.convertTime("years", 2));
     Map<String, org.hl7.fhir.r4.model.Resource> resources = bundle.getEntry().stream()
@@ -513,8 +516,17 @@ public class FHIRR4ExporterTest {
     int reminders = 0;
     int medicationPlans = 0;
     int cancellations = 0;
+    int dischargeTeams = 0;
     for (var resource : resources.values()) {
-      if (resource instanceof Schedule) {
+      if (resource instanceof CareTeam) {
+        var team = (CareTeam) resource;
+        dischargeTeams++;
+        var category = team.getCategoryFirstRep().getCodingFirstRep();
+        assertEquals("http://loinc.org", category.getSystem());
+        assertEquals("LA27976-2", category.getCode());
+        assertEquals("Encounter-focused care team", category.getDisplay());
+        assertEquals("Encounter", resources.get(team.getEncounter().getReference()).fhirType());
+      } else if (resource instanceof Schedule) {
         schedules++;
         for (var actor : ((Schedule) resource).getActor()) {
           var target = resources.get(actor.getReference());
@@ -559,6 +571,7 @@ public class FHIRR4ExporterTest {
     }
     assertEquals(20, schedules);
     assertEquals(20, medicationPlans);
+    assertEquals(1, dischargeTeams);
     assertTrue(reminders > 0);
     assertTrue(cancellations > 0);
   }

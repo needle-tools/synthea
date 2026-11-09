@@ -5018,7 +5018,7 @@ public class FhirR4 {
         .setEnd(encounter.stop != 0L ? new Date(encounter.stop) : null));
 
     team.addCategory(new CodeableConcept().addCoding(new Coding(
-        "http://loinc.org", "LA28866-4", "Healthcare")));
+        "http://loinc.org", "LA27976-2", "Encounter-focused care team")));
 
     // Participant: attending physician
     if (encounter.clinician != null) {
