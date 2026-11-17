@@ -350,6 +350,21 @@ application {
   mainClass = 'App'
 }
 
+tasks.register('oncologyCases', JavaExec) {
+  group = 'Application'
+  description = 'Generate reproducible oncology scenario case files in FHIR R4'
+  classpath = sourceSets.main.runtimeClasspath
+  mainClass = 'org.mitre.synthea.export.OncologyCaseExporter'
+  doFirst {
+    if (!project.hasProperty('output') || !project.hasProperty('asOf')) {
+      throw new GradleException('Specify -Poutput=<new directory> and -PasOf=YYYY-MM-DD')
+    }
+    args project.property('output'), project.findProperty('count') ?: '27',
+        project.findProperty('seed') ?: '42', project.property('asOf'),
+        project.findProperty('scenario') ?: 'mixed', project.findProperty('complexity') ?: 'mixed'
+  }
+}
+
 run {
   // args are called "arams" because they are called with -P,
   // ex. gradle run -Params="['arg1', 'args2']"
