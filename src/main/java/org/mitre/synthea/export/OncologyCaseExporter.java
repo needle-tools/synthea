@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import org.mitre.synthea.engine.OncologyClinicalValidator;
 import org.mitre.synthea.engine.OncologyScenario;
 import org.mitre.synthea.engine.OncologyScenario.Complexity;
 import org.mitre.synthea.engine.OncologyScenario.Event;
@@ -73,7 +74,7 @@ public final class OncologyCaseExporter {
   }
 
   private String id(String key) {
-    return UUID.nameUUIDFromBytes(("oncology-v1:" + journey.seed() + ":" + journey.index()
+    return UUID.nameUUIDFromBytes(("oncology-v2:" + journey.seed() + ":" + journey.index()
         + ":" + journey.scenario() + ":" + journey.complexity() + ":" + journey.asOf()
         + ":" + key).getBytes(StandardCharsets.UTF_8)).toString();
   }
@@ -112,7 +113,7 @@ public final class OncologyCaseExporter {
       case "problem":
         result = add("Condition", event.key(), "subject", ref(patient), "onsetDateTime", date,
             "clinicalStatus", coded("http://terminology.hl7.org/CodeSystem/condition-clinical",
-                "active", "Active"),
+                event.status(), event.status()),
             "verificationStatus", coded("http://terminology.hl7.org/CodeSystem/condition-ver-status",
                 "confirmed", "Confirmed"),
             "code", event.kind().equals("condition")
@@ -150,6 +151,11 @@ public final class OncologyCaseExporter {
       case "stage":
       case "histology":
       case "hemoglobin":
+      case "lvef":
+      case "anc":
+      case "platelets":
+      case "er-percent":
+      case "pr-percent":
         String loinc = null;
         switch (event.kind()) {
           case "er":
@@ -179,6 +185,12 @@ public final class OncologyCaseExporter {
         } else if (event.kind().equals("hemoglobin")) {
           result.add("valueQuantity", object("value", Double.parseDouble(event.value()),
               "unit", "g/dL", "system", "http://unitsofmeasure.org", "code", "g/dL"));
+        } else if (java.util.Set.of("lvef", "anc", "platelets", "er-percent", "pr-percent")
+            .contains(event.kind())) {
+          String unit = java.util.Set.of("anc", "platelets")
+              .contains(event.kind()) ? "10*9/L" : "%";
+          result.add("valueQuantity", object("value", Double.parseDouble(event.value()),
+              "unit", unit, "system", "http://unitsofmeasure.org", "code", unit));
         } else {
           result.add("valueCodeableConcept", concept(event.value()));
         }
@@ -213,6 +225,25 @@ public final class OncologyCaseExporter {
             "subject", ref(patient), "performedDateTime", date,
             "code", concept(event.description()));
         break;
+      case "medication-order":
+        result = add("MedicationRequest", event.key(), "status", event.status(), "intent", "order",
+            "subject", ref(patient), "authoredOn", date,
+            "medicationCodeableConcept", concept(event.value()),
+            "note", array(object("text", event.description())));
+        if (event.status().equals("on-hold")) {
+          result.add("statusReason", concept(
+              "Persistent grade 2 sensory neuropathy; review pending"));
+        } else if (event.status().equals("stopped")) {
+          result.add("statusReason", concept("Biopsy-confirmed metastatic progression"));
+        }
+        break;
+      case "medication":
+        result = add("MedicationAdministration", event.key(), "status", event.status(),
+            "subject", ref(patient), "effectiveDateTime", date,
+            "context", ref(episode),
+            "medicationCodeableConcept", concept(event.value()),
+            "note", array(object("text", event.description())));
+        break;
       case "assessment":
         result = add("ClinicalImpression", event.key(), "status", "completed",
             "subject", ref(patient), "effectiveDateTime", date, "summary", event.description());
@@ -220,9 +251,10 @@ public final class OncologyCaseExporter {
       default:
         throw new IllegalArgumentException("Unknown event kind: " + event.kind());
     }
-    // Specimen and Task are not allowed contexts of the published episode extension.
-    // Their membership is expressed by the case List (and Task.focus).
-    if (!event.kind().equals("specimen") && !event.kind().equals("task")) {
+    // Published R4 extension contexts. Other members use native references and the case List.
+    if (java.util.Set.of("Observation", "DiagnosticReport", "ServiceRequest", "CarePlan",
+        "ClinicalImpression", "Condition", "Procedure")
+        .contains(result.get("resourceType").getAsString())) {
       result.add("extension",
           array(object("url", EPISODE_EXTENSION, "valueReference", ref(episode))));
     }
@@ -253,7 +285,8 @@ public final class OncologyCaseExporter {
         JsonArray findings = new JsonArray();
         for (Event finding : journey.events()) {
           if (event.sample().equals(finding.sample())
-              && java.util.Set.of("er", "pr", "her2", "histology").contains(finding.kind())) {
+              && java.util.Set.of("er", "pr", "her2", "er-percent", "pr-percent", "histology")
+                  .contains(finding.kind())) {
             findings.add(ref(eventRefs.get(finding.key())));
           }
         }
@@ -279,6 +312,13 @@ public final class OncologyCaseExporter {
         case "report":
         case "therapy":
         case "therapy-request":
+        case "medication-order":
+          resource.add("basedOn", array(ref(cause)));
+          break;
+        case "medication":
+          resource.add("request", ref(cause));
+          break;
+        case "procedure":
           resource.add("basedOn", array(ref(cause)));
           break;
         case "board":
@@ -310,6 +350,7 @@ public final class OncologyCaseExporter {
   }
 
   public static JsonObject export(Journey journey) {
+    OncologyClinicalValidator.requireValid(journey);
     return new OncologyCaseExporter(journey).bundle();
   }
 
@@ -353,7 +394,8 @@ public final class OncologyCaseExporter {
       cases.add(object("file", filename, "scenario", selected.name(), "complexity", depth.name(),
           "resources", bundle.getAsJsonArray("entry").size()));
     }
-    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v1",
+    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v2",
+        "clinicalContract", "breast-scenarios-v2", "clinicalValidation", "passed",
         "seed", seed, "asOf", asOf.toString(), "cases", cases)) + "\n", StandardCharsets.UTF_8,
         java.nio.file.StandardOpenOption.CREATE_NEW);
     System.out.println("Generated " + count + " synthetic oncology case files in " + output);

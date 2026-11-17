@@ -9,7 +9,9 @@ import ca.uhn.fhir.context.FhirContext;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.time.LocalDate;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import org.junit.Test;
 import org.mitre.synthea.engine.OncologyScenario;
@@ -78,7 +80,7 @@ public class OncologyCaseExporterTest {
         assertTrue(events.stream().anyMatch(e -> e.kind().equals("task")));
         if (scenario == Scenario.AWAITING_PATHOLOGY) {
           assertFalse(events.stream().anyMatch(e -> e.kind().equals("condition")
-              || e.kind().equals("therapy")));
+              || e.kind().equals("medication")));
           assertTrue(events.stream().anyMatch(e -> e.kind().equals("report")
               && e.status().equals("registered")));
         }
@@ -93,13 +95,49 @@ public class OncologyCaseExporterTest {
         if (scenario == Scenario.TOXICITY) {
           var interruption = events.stream().filter(e -> e.key().equals("interruption"))
               .findFirst().orElseThrow();
-          assertFalse(events.stream().anyMatch(e -> e.kind().equals("therapy")
+          assertFalse(events.stream().anyMatch(e -> e.kind().equals("medication")
               && e.date().isAfter(interruption.date())));
           assertTrue(events.stream().anyMatch(e -> e.key().equals("therapy-order")
               && e.status().equals("on-hold")));
         }
       }
     }
+  }
+
+  @Test
+  public void exportsClinicalTreatmentAndSafetyEvidenceAsLinkedFhir() {
+    JsonObject bundle = generate(0, Scenario.TOXICITY, Complexity.SIMPLE);
+    Map<String, JsonObject> resources = new HashMap<>();
+    for (JsonElement entry : bundle.getAsJsonArray("entry")) {
+      JsonObject resource = entry.getAsJsonObject().getAsJsonObject("resource");
+      resources.put(resource.get("resourceType").getAsString() + "/"
+          + resource.get("id").getAsString(), resource);
+    }
+    Map<String, Integer> drugs = new HashMap<>();
+    for (JsonObject resource : resources.values()) {
+      if (resource.get("resourceType").getAsString().equals("MedicationAdministration")) {
+        String drug = resource.getAsJsonObject("medicationCodeableConcept")
+            .get("text").getAsString();
+        drugs.merge(drug, 1, Integer::sum);
+        JsonObject order = resources.get(resource.getAsJsonObject("request")
+            .get("reference").getAsString());
+        assertEquals("MedicationRequest", order.get("resourceType").getAsString());
+        assertEquals(drug, order.getAsJsonObject("medicationCodeableConcept")
+            .get("text").getAsString());
+        assertTrue(resource.getAsJsonObject("context").get("reference").getAsString()
+            .startsWith("EpisodeOfCare/"));
+        assertEquals("on-hold", order.get("status").getAsString());
+        assertTrue(order.has("statusReason"));
+        assertTrue(LocalDate.parse(order.get("authoredOn").getAsString()).compareTo(
+            LocalDate.parse(resource.get("effectiveDateTime").getAsString())) <= 0);
+      }
+    }
+    assertEquals(Map.of("docetaxel", 2, "carboplatin", 2,
+        "trastuzumab", 2, "pertuzumab", 2), drugs);
+    assertTrue(resources.values().stream().anyMatch(r -> r.get("resourceType").getAsString()
+        .equals("Observation") && r.getAsJsonObject("code").get("text").getAsString()
+        .equals("Left ventricular ejection fraction")
+        && r.getAsJsonObject("valueQuantity").get("value").getAsInt() == 63));
   }
 
   @Test
