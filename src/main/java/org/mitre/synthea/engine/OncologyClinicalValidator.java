@@ -49,7 +49,11 @@ public final class OncologyClinicalValidator {
         Event hold = byKey.get("interruption");
         check(hold == null || event.date().isBefore(hold.date()), "toxicity-hold", issues);
       }
-      if (Set.of("medication", "medication-order", "procedure").contains(event.kind())) {
+      if (event.kind().equals("course")) {
+        java.time.LocalDate end = java.time.LocalDate.parse(event.value());
+        check(!end.isBefore(event.date()) && !end.isAfter(journey.asOf()), "course-period", issues);
+      }
+      if (Set.of("medication", "medication-order", "procedure", "course").contains(event.kind())) {
         before(byKey, "pathology", event.key(), "histology-before-treatment", issues);
         before(byKey, "primary-er", event.key(), "receptors-before-treatment", issues);
         before(byKey, "primary-her2", event.key(), "receptors-before-treatment", issues);
@@ -61,9 +65,12 @@ public final class OncologyClinicalValidator {
       }
       if (event.kind().equals("er") || event.kind().equals("pr")) {
         Event percent = byKey.get(event.key() + "-percent");
-        check(percent != null && (event.value().equals("Positive")
-            ? Double.parseDouble(percent.value()) > 10
-                && Double.parseDouble(percent.value()) <= 100 : percent.value().equals("0")),
+        double fraction = percent == null ? Double.NaN : Double.parseDouble(percent.value());
+        check(event.value().equals("Low positive")
+            ? event.kind().equals("er") && fraction >= 1 && fraction <= 10
+            : event.value().equals("Positive")
+                ? (event.kind().equals("er") ? fraction > 10 : fraction >= 1) && fraction <= 100
+            : event.value().equals("Negative") && fraction >= 0 && fraction < 1,
             "receptor-interpretation", issues);
       }
       if (event.kind().equals("medication") && event.value().equals("trastuzumab")) {
@@ -83,13 +90,16 @@ public final class OncologyClinicalValidator {
           && e.value().equals("docetaxel")).sorted(java.util.Comparator.comparing(Event::date))
           .collect(java.util.stream.Collectors.toList());
       boolean held = byKey.containsKey("interruption");
-      check(cycles.size() == (held ? 2 : 6), "tchp-course-length", issues);
-      check(byKey.get("therapy-order").status().equals(held ? "on-hold" : "completed"),
+      boolean restarted = journey.scenario() == Scenario.DELAYED_RESTART;
+      check(cycles.size() == (held ? 2 : restarted ? 3 : 6), "tchp-course-length", issues);
+      check(byKey.get("therapy-order").status().equals(held ? "on-hold"
+          : restarted ? "active" : "completed"),
           "course-status", issues);
       for (int i = 0; i < cycles.size(); i++) {
         Event cycle = cycles.get(i);
         if (i > 0) {
-          check(ChronoUnit.DAYS.between(cycles.get(i - 1).date(), cycle.date()) == 21,
+          int interval = restarted && i == 2 ? 42 : 21;
+          check(ChronoUnit.DAYS.between(cycles.get(i - 1).date(), cycle.date()) == interval,
               "tchp-interval", issues);
         }
         for (String drug : List.of("carboplatin", "trastuzumab", "pertuzumab")) {
@@ -98,7 +108,15 @@ public final class OncologyClinicalValidator {
               "tchp-combination", issues);
         }
       }
-      if (!held && !cycles.isEmpty()) {
+      if (restarted) {
+        before(byKey, "restart-echo", "restart-clearance", "restart-reviewed", issues);
+        before(byKey, "restart-clearance", "cycle-3-docetaxel", "restart-reviewed", issues);
+        for (Event cycle : cycles) {
+          check(events.stream().anyMatch(e -> e.kind().equals("weight")
+              && e.date().equals(cycle.date()) && Double.parseDouble(e.value()) > 0),
+              "weight-for-infusion", issues);
+        }
+      } else if (!held && !cycles.isEmpty()) {
         before(byKey, cycles.get(cycles.size() - 1).key(), "surgery",
             "neoadjuvant-before-surgery", issues);
         check(byKey.containsKey("maintenance-order"), "her2-continuation", issues);
@@ -128,6 +146,12 @@ public final class OncologyClinicalValidator {
           e.kind().equals("medication") && !e.date().isBefore(byKey.get("metastasis").date())),
           "metastatic-decision-pending", issues);
     }
+    if (journey.scenario() == Scenario.DISCORDANT_MARKERS) {
+      completedBefore(byKey, "adjuvant-ec", "adjuvant-taxane", issues);
+      completedBefore(byKey, "adjuvant-taxane", "radiotherapy-start", issues);
+      check(value(byKey, "primary-her2", "IHC 1+") && value(byKey, "metastatic-her2", "IHC 3+")
+          && pending(byKey, "reference-pathology"), "discordant-pathology-review", issues);
+    }
     if (journey.scenario() == Scenario.AWAITING_PATHOLOGY) {
       check(!byKey.containsKey("diagnosis") && events.stream().noneMatch(e ->
           Set.of("medication", "medication-order", "procedure").contains(e.kind())),
@@ -152,7 +176,111 @@ public final class OncologyClinicalValidator {
             && !e.date().isBefore(byKey.get("followup").date())), "followup-uncertainty", issues);
       }
     }
+    validateBoardSnapshot(journey, byKey, issues);
     return List.copyOf(issues);
+  }
+
+  private static void validateBoardSnapshot(Journey journey, Map<String, Event> events,
+      List<String> issues) {
+    String requiredEvidence;
+    switch (journey.scenario()) {
+      case ER_LOW_REVIEW:
+        check(value(events, "primary-er", "Low positive") && events.containsKey("controls")
+            && pending(events, "er-review") && value(events, "primary-pr", "Negative")
+            && value(events, "primary-her2", "IHC 1+"), "er-low-pathology", issues);
+        requiredEvidence = "er-review";
+        break;
+      case EQUIVOCAL_HER2:
+        check(value(events, "primary-her2", "IHC 2+") && pending(events, "ish")
+            && events.values().stream().noneMatch(e -> Set.of("course", "medication",
+                "medication-order").contains(e.kind())
+                || e.kind().equals("her2") && !e.key().equals("primary-her2")),
+            "equivocal-awaits-ish", issues);
+        requiredEvidence = "ish";
+        break;
+      case RESIDUAL_TNBC:
+      case HEREDITARY_REVIEW:
+        check(value(events, "primary-er", "Negative") && value(events, "primary-pr", "Negative")
+            && value(events, "primary-her2", "IHC 0"), "triple-negative-pathology", issues);
+        completedBefore(events, "taxane", "ec", issues);
+        completedBefore(events, "ec", "operation", issues);
+        if (journey.scenario() == Scenario.HEREDITARY_REVIEW) {
+          check(pending(events, "panel") && events.containsKey("blood")
+              && "germline".equals(events.get("panel").sample())
+              && events.values().stream().noneMatch(e -> e.kind().equals("report")
+                  && "germline".equals(e.sample()) && e.status().equals("final"))
+              && value(events, "post-stage", "ypT0 ypN0 cM0"), "hereditary-workup", issues);
+          requiredEvidence = "panel";
+        } else {
+          requiredEvidence = "rcb";
+          check(pending(events, "rcb"), "residual-burden-pending", issues);
+        }
+        break;
+      case RESIDUAL_HER2:
+      case PULMONARY_RELAPSE:
+        check(value(events, "primary-her2", "IHC 3+"), "primary-her2-positive", issues);
+        completedBefore(events, "tchp", "operation", issues);
+        requiredEvidence = "resection";
+        if (journey.scenario() == Scenario.PULMONARY_RELAPSE) {
+          completedBefore(events, "continuation", "lung-imaging", issues);
+          before(events, "lung-report", "metastatic-board", "biopsy-before-board", issues);
+          check(value(events, "lung-her2", "IHC 3+") && value(events, "m1", "M1 (lung)"),
+              "lung-recurrence-confirmed", issues);
+          check(events.containsKey("payer") && events.containsKey("lung-report")
+              && events.values().stream().noneMatch(e -> Set.of("medication", "course")
+                  .contains(e.kind()) && !e.date().isBefore(events.get("lung-report").date())),
+              "relapse-treatment-proposed", issues);
+          requiredEvidence = "payer";
+        }
+        break;
+      case LATE_LIVER_LESION:
+        completedBefore(events, "endocrine", "liver-imaging", issues);
+        check(value(events, "primary-er", "Positive") && events.containsKey("endocrine")
+            && ChronoUnit.DAYS.between(events.get("endocrine").date(),
+                java.time.LocalDate.parse(events.get("endocrine").value())) >= 1825,
+            "completed-five-year-endocrine-course", issues);
+        check(pending(events, "liver-order") && events.values().stream()
+            .noneMatch(e -> e.kind().equals("stage") && e.value().contains("M1")
+                || e.kind().equals("report") && "liver".equals(e.sample())),
+            "suspicious-lesion-unconfirmed", issues);
+        requiredEvidence = "liver-order";
+        break;
+      case NODE_POSITIVE_TCHP:
+        check(value(events, "primary-her2", "IHC 3+") && pending(events, "interim"),
+            "interim-restaging", issues);
+        before(events, "baseline-echo", "first-cycle", "pretreatment-echo", issues);
+        requiredEvidence = "interim";
+        break;
+      default:
+        return;
+    }
+    if (journey.scenario() == Scenario.RESIDUAL_HER2
+        || journey.scenario() == Scenario.RESIDUAL_TNBC) {
+      check(value(events, "post-stage", "ypT2 ypN1a cM0"), "residual-stage", issues);
+      before(events, "response", "operation", "response-before-surgery", issues);
+    }
+    if (value(events, "stage", "cT2 cN1 cM0")) {
+      check(events.containsKey("node-pathology")
+          && "axilla".equals(events.get("node-pathology").sample()),
+          "node-positive-evidence", issues);
+    }
+    if (events.containsKey("operation")) {
+      before(events, "operation", "resection", "surgical-pathology-order", issues);
+      before(events, "resection", "post-stage", "postoperative-staging", issues);
+    }
+    check(events.containsKey("decision") && requiredEvidence.equals(events.get("decision").cause())
+        && "PHYSICIAN".equals(events.get("decision").value()), "board-dependency", issues);
+  }
+
+  private static boolean pending(Map<String, Event> events, String key) {
+    return events.containsKey(key) && events.get(key).status().equals("active");
+  }
+
+  private static void completedBefore(Map<String, Event> events, String course, String next,
+      List<String> issues) {
+    check(events.containsKey(course) && events.containsKey(next)
+        && !java.time.LocalDate.parse(events.get(course).value()).isAfter(events.get(next).date()),
+        "completed-course-sequence", issues);
   }
 
   private static boolean value(Map<String, Event> events, String key, String value) {

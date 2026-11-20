@@ -153,6 +153,79 @@ public class OncologyClinicalValidatorTest {
   }
 
   @Test
+  public void rejectsContradictionsInBoardSnapshots() {
+    rejects(journey(Scenario.RESIDUAL_TNBC), "residual-stage", events -> {
+      events.replaceAll(e -> e.key().equals("post-stage")
+          ? change(e, e.date(), "ypT0 ypN0 cM0") : e);
+      return events;
+    });
+    rejects(journey(Scenario.EQUIVOCAL_HER2), "equivocal-awaits-ish", events -> {
+      events.removeIf(e -> e.key().equals("ish"));
+      return events;
+    });
+    rejects(journey(Scenario.LATE_LIVER_LESION), "suspicious-lesion-unconfirmed", events -> {
+      events.add(new Event("m1", "stage", SNAPSHOT, "final", "Metastatic disease",
+          null, "M1 (liver)", null));
+      return events;
+    });
+    rejects(journey(Scenario.PULMONARY_RELAPSE), "lung-recurrence-confirmed", events -> {
+      events.replaceAll(e -> e.key().equals("lung-her2") ? change(e, e.date(), "IHC 1+") : e);
+      return events;
+    });
+    rejects(journey(Scenario.NODE_POSITIVE_TCHP), "node-positive-evidence", events -> {
+      events.removeIf(e -> e.key().equals("node-pathology"));
+      return events;
+    });
+    rejects(journey(Scenario.HEREDITARY_REVIEW), "hereditary-workup", events -> {
+      events.removeIf(e -> e.key().equals("blood"));
+      return events;
+    });
+    rejects(journey(Scenario.HEREDITARY_REVIEW), "hereditary-workup", events -> {
+      events.add(new Event("panel-result", "report", SNAPSHOT, "final", "Panel reported",
+          "germline", null, null));
+      return events;
+    });
+    rejects(journey(Scenario.PULMONARY_RELAPSE), "relapse-treatment-proposed", events -> {
+      events.add(new Event("infusion", "course", SNAPSHOT, "completed", "First metastatic infusion",
+          null, SNAPSHOT.toString(), null));
+      return events;
+    });
+    rejects(journey(Scenario.DISCORDANT_MARKERS), "discordant-pathology-review", events -> {
+      events.removeIf(e -> e.key().equals("reference-pathology"));
+      return events;
+    });
+    rejects(journey(Scenario.RESIDUAL_HER2), "primary-her2-positive", events -> {
+      events.replaceAll(e -> e.key().equals("primary-her2") ? change(e, e.date(), "IHC 1+") : e);
+      return events;
+    });
+  }
+
+  @Test
+  public void checksTheLowPositiveBoundaryAndInfusionRestart() {
+    Journey low = journey(Scenario.ER_LOW_REVIEW);
+    for (String value : List.of("1", "10")) {
+      var events = new ArrayList<>(low.events());
+      events.replaceAll(e -> e.key().equals("primary-er-percent") ? change(e, e.date(), value) : e);
+      assertEquals(List.of(), OncologyClinicalValidator.validate(low, events));
+    }
+    for (String value : List.of("0", "11")) {
+      rejects(low, "receptor-interpretation", events -> {
+        events.replaceAll(e -> e.key().equals("primary-er-percent")
+            ? change(e, e.date(), value) : e);
+        return events;
+      });
+    }
+    rejects(journey(Scenario.DELAYED_RESTART), "restart-reviewed", events -> {
+      events.removeIf(e -> e.key().equals("restart-clearance"));
+      return events;
+    });
+    rejects(journey(Scenario.DELAYED_RESTART), "weight-for-infusion", events -> {
+      events.removeIf(e -> e.key().equals("weight-2"));
+      return events;
+    });
+  }
+
+  @Test
   public void displayComplexityPreservesTheClinicalCourse() {
     for (Scenario scenario : Scenario.values()) {
       List<String> simple = course(OncologyScenario.simulate(42, 0, SNAPSHOT,
@@ -166,7 +239,7 @@ public class OncologyClinicalValidatorTest {
 
   private List<String> course(Journey journey) {
     return journey.events().stream().filter(e -> List.of("medication", "medication-order",
-        "procedure", "stage").contains(e.kind())).map(e -> e.kind() + ":" + e.date()
+        "procedure", "course", "stage").contains(e.kind())).map(e -> e.kind() + ":" + e.date()
             + ":" + e.status() + ":" + e.value() + ":" + e.description()).toList();
   }
 }

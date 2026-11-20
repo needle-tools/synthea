@@ -73,8 +73,13 @@ public final class OncologyCaseExporter {
     return object("reference", reference);
   }
 
+  private static JsonObject milligrams(double value) {
+    return object("value", value, "unit", "mg",
+        "system", "http://unitsofmeasure.org", "code", "mg");
+  }
+
   private String id(String key) {
-    return UUID.nameUUIDFromBytes(("oncology-v2:" + journey.seed() + ":" + journey.index()
+    return UUID.nameUUIDFromBytes(("oncology-v3:" + journey.seed() + ":" + journey.index()
         + ":" + journey.scenario() + ":" + journey.complexity() + ":" + journey.asOf()
         + ":" + key).getBytes(StandardCharsets.UTF_8)).toString();
   }
@@ -105,8 +110,10 @@ public final class OncologyCaseExporter {
     switch (event.kind()) {
       case "specimen":
         result = add("Specimen", event.key(), "status", event.status(), "subject", ref(patient),
-            "type", concept("Tissue"), "collection", object("collectedDateTime", date,
-                "bodySite", concept(event.sample().equals("metastatic") ? "Liver" : "Breast")));
+            "type", concept(event.sample().equals("germline") ? "Blood" : "Tissue"),
+            "collection", object("collectedDateTime", date, "bodySite", concept(
+                event.value() != null ? event.value()
+                    : event.sample().equals("metastatic") ? "Liver" : "Breast")));
         specimens.put(event.sample(), reference(result));
         break;
       case "condition":
@@ -122,13 +129,14 @@ public final class OncologyCaseExporter {
         break;
       case "request":
       case "molecular":
+      case "investigation":
       case "therapy-request":
         result = add("ServiceRequest", event.key(), "status", event.status(), "intent", "order",
             "subject", ref(patient), "authoredOn", date, "code", concept(event.description()));
         if (event.kind().equals("request") && journey.scenario() != Scenario.AWAITING_PATHOLOGY) {
           result.addProperty("status", "completed");
         }
-        if (!event.kind().equals("request")) {
+        if (!event.kind().equals("request") && !event.kind().equals("investigation")) {
           result.add("category", array(coded(WORKBENCH + "workflow",
               event.kind().equals("molecular") ? "molecular" : "therapy", event.description())));
         }
@@ -151,11 +159,13 @@ public final class OncologyCaseExporter {
       case "stage":
       case "histology":
       case "hemoglobin":
+      case "weight":
       case "lvef":
       case "anc":
       case "platelets":
       case "er-percent":
       case "pr-percent":
+      case "percent":
         String loinc = null;
         switch (event.kind()) {
           case "er":
@@ -173,6 +183,9 @@ public final class OncologyCaseExporter {
           case "hemoglobin":
             loinc = "718-7";
             break;
+          case "weight":
+            loinc = "29463-7";
+            break;
           default:
             break;
         }
@@ -182,11 +195,14 @@ public final class OncologyCaseExporter {
                 : coded("http://loinc.org", loinc, event.description()));
         if (event.kind().equals("ecog")) {
           result.addProperty("valueInteger", Integer.parseInt(event.value()));
+        } else if (event.kind().equals("weight")) {
+          result.add("valueQuantity", object("value", Double.parseDouble(event.value()),
+              "unit", "kg", "system", "http://unitsofmeasure.org", "code", "kg"));
         } else if (event.kind().equals("hemoglobin")) {
           result.add("valueQuantity", object("value", Double.parseDouble(event.value()),
               "unit", "g/dL", "system", "http://unitsofmeasure.org", "code", "g/dL"));
-        } else if (java.util.Set.of("lvef", "anc", "platelets", "er-percent", "pr-percent")
-            .contains(event.kind())) {
+        } else if (java.util.Set.of("lvef", "anc", "platelets", "er-percent", "pr-percent",
+            "percent").contains(event.kind())) {
           String unit = java.util.Set.of("anc", "platelets")
               .contains(event.kind()) ? "10*9/L" : "%";
           result.add("valueQuantity", object("value", Double.parseDouble(event.value()),
@@ -213,7 +229,7 @@ public final class OncologyCaseExporter {
         result = add("Task", event.key(), "status", event.status(), "intent", "order",
             "for", ref(patient), "focus", ref(episode), "description", event.description(),
             "code", concept("Review"), "authoredOn", date,
-            "performerType", array(concept("CASE_MANAGER")),
+            "performerType", array(concept(event.value() == null ? "CASE_MANAGER" : event.value())),
             "restriction", object("period", object("end", date)));
         if (event.status().equals("on-hold")) {
           result.add("statusReason", concept(event.description()));
@@ -225,11 +241,22 @@ public final class OncologyCaseExporter {
             "subject", ref(patient), "performedDateTime", date,
             "code", concept(event.description()));
         break;
+      case "course":
+        result = add("Procedure", event.key(), "status", event.status(), "subject", ref(patient),
+            "performedPeriod", object("start", date, "end", event.value()),
+            "code", concept(event.description()));
+        break;
       case "medication-order":
         result = add("MedicationRequest", event.key(), "status", event.status(), "intent", "order",
             "subject", ref(patient), "authoredOn", date,
             "medicationCodeableConcept", concept(event.value()),
             "note", array(object("text", event.description())));
+        if ("letrozole".equals(event.value())) {
+          result.add("dosageInstruction", array(object("text", "2.5 mg orally once daily",
+              "route", concept("Oral"),
+              "timing", object("repeat", object("frequency", 1, "period", 1, "periodUnit", "d")),
+              "doseAndRate", array(object("doseQuantity", milligrams(2.5))))));
+        }
         if (event.status().equals("on-hold")) {
           result.add("statusReason", concept(
               "Persistent grade 2 sensory neuropathy; review pending"));
@@ -243,6 +270,24 @@ public final class OncologyCaseExporter {
             "context", ref(episode),
             "medicationCodeableConcept", concept(event.value()),
             "note", array(object("text", event.description())));
+        boolean weightedInfusion = journey.scenario() == Scenario.DELAYED_RESTART
+            && event.value().equals("trastuzumab");
+        if ("pertuzumab".equals(event.value()) || weightedInfusion) {
+          boolean loading = journey.events().stream().noneMatch(previous ->
+              previous.kind().equals("medication") && event.value().equals(previous.value())
+                  && previous.date().isBefore(event.date())
+                  && previous.date().isAfter(event.date().minusWeeks(6)));
+          double amount;
+          if (weightedInfusion) {
+            Event weight = journey.events().stream().filter(e -> e.kind().equals("weight")
+                && e.date().equals(event.date())).findFirst().orElseThrow();
+            amount = Double.parseDouble(weight.value()) * (loading ? 8 : 6);
+          } else {
+            amount = loading ? 840 : 420;
+          }
+          result.add("dosage", object("route", concept("Intravenous infusion"),
+              "dose", milligrams(amount)));
+        }
         break;
       case "assessment":
         result = add("ClinicalImpression", event.key(), "status", "completed",
@@ -285,8 +330,8 @@ public final class OncologyCaseExporter {
         JsonArray findings = new JsonArray();
         for (Event finding : journey.events()) {
           if (event.sample().equals(finding.sample())
-              && java.util.Set.of("er", "pr", "her2", "er-percent", "pr-percent", "histology")
-                  .contains(finding.kind())) {
+              && java.util.Set.of("er", "pr", "her2", "er-percent", "pr-percent", "percent",
+                  "histology", "stage").contains(finding.kind())) {
             findings.add(ref(eventRefs.get(finding.key())));
           }
         }
@@ -303,11 +348,22 @@ public final class OncologyCaseExporter {
       }
       switch (event.kind()) {
         case "task":
-          resource.add(event.status().equals("completed") ? "output" : "input",
-              array(object("type", coded(WORKBENCH + "workflow",
-                  event.status().equals("completed") ? "evidence" : "dependency",
-                  "Supporting resource"),
-                  "valueReference", ref(cause))));
+          boolean completed = event.status().equals("completed");
+          JsonObject source = resources.get(cause);
+          String state = source.has("status") ? source.get("status").getAsString() : "";
+          boolean outstanding = (cause.startsWith("Task/") || cause.startsWith("ServiceRequest/"))
+              && !state.equals("completed");
+          JsonArray parameters = array(object("type", coded(WORKBENCH + "workflow",
+              outstanding && !completed ? "dependency" : "evidence", "Supporting resource"),
+              "valueReference", ref(cause)));
+          if (!completed && "PHYSICIAN".equals(event.value())) {
+            for (String field : java.util.List.of("requires_medical_validation",
+                "abschlussnachweis_noetig")) {
+              parameters.add(object("type", coded(WORKBENCH + "workflow", field, field),
+                  "valueBoolean", true));
+            }
+          }
+          resource.add(completed ? "output" : "input", parameters);
           break;
         case "report":
         case "therapy":
@@ -330,9 +386,36 @@ public final class OncologyCaseExporter {
       }
     }
     if (eventRefs.containsKey("diagnosis")) {
+      JsonObject diagnosis = resources.get(eventRefs.get("diagnosis"));
+      journey.events().stream().filter(e -> e.key().equals("board-summary")).findFirst()
+          .ifPresent(summary -> diagnosis.add("note",
+              array(object("text", summary.description()))));
       resources.get(episode).add("diagnosis",
           array(object("condition", ref(eventRefs.get("diagnosis")))));
       pathway.add("addresses", array(ref(eventRefs.get("diagnosis"))));
+    }
+    // Highlight the latest findings for handover and retain links to the dated source records.
+    LocalDate since = journey.events().stream().filter(e -> e.kind().equals("board")
+        && e.status().equals("completed") && e.date().isBefore(journey.asOf()))
+        .map(Event::date).max(LocalDate::compareTo).orElse(journey.asOf().minusDays(30));
+    JsonArray updates = new JsonArray();
+    JsonArray notes = new JsonArray();
+    for (Event item : journey.events()) {
+      if (item.kind().equals("task")) {
+        resources.get(eventRefs.get(item.key())).add("basedOn", array(ref(reference(pathway))));
+      }
+      if (item.date().isBefore(since) || !java.util.Set.of("report", "imaging", "problem",
+          "molecular", "investigation", "board", "medication-order").contains(item.kind())) {
+        continue;
+      }
+      updates.add(object("item", ref(eventRefs.get(item.key()))));
+      notes.add(object("text", item.date() + " — " + item.description()
+          + " (" + item.status() + ")"));
+    }
+    if (!updates.isEmpty()) {
+      add("List", "handover", "status", "current", "mode", "snapshot", "subject", ref(patient),
+          "date", journey.asOf().toString(), "code", coded(WORKBENCH + "workflow", "changes",
+              "Recent findings and decisions"), "entry", updates, "note", notes);
     }
     JsonArray members = new JsonArray();
     for (String member : resources.keySet()) {
@@ -380,8 +463,9 @@ public final class OncologyCaseExporter {
       Scenario selected = scenario.equals("mixed")
           ? Scenario.values()[index % Scenario.values().length]
           : Scenario.valueOf(scenario.toUpperCase(Locale.ROOT).replace('-', '_'));
+      int scenarioCount = scenario.equals("mixed") ? Scenario.values().length : 1;
       Complexity depth = complexity.equals("mixed")
-          ? Complexity.values()[(index + index / Scenario.values().length)
+          ? Complexity.values()[(index % scenarioCount + index / scenarioCount)
               % Complexity.values().length]
           : Complexity.valueOf(complexity.toUpperCase(Locale.ROOT));
       Journey journey = OncologyScenario.simulate(seed, index, asOf, selected, depth);
@@ -394,8 +478,8 @@ public final class OncologyCaseExporter {
       cases.add(object("file", filename, "scenario", selected.name(), "complexity", depth.name(),
           "resources", bundle.getAsJsonArray("entry").size()));
     }
-    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v2",
-        "clinicalContract", "breast-scenarios-v2", "clinicalValidation", "passed",
+    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v3",
+        "clinicalContract", "breast-scenarios-v3", "clinicalValidation", "passed",
         "seed", seed, "asOf", asOf.toString(), "cases", cases)) + "\n", StandardCharsets.UTF_8,
         java.nio.file.StandardOpenOption.CREATE_NEW);
     System.out.println("Generated " + count + " synthetic oncology case files in " + output);

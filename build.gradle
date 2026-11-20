@@ -359,7 +359,7 @@ tasks.register('oncologyCases', JavaExec) {
     if (!project.hasProperty('output') || !project.hasProperty('asOf')) {
       throw new GradleException('Specify -Poutput=<new directory> and -PasOf=YYYY-MM-DD')
     }
-    args project.property('output'), project.findProperty('count') ?: '27',
+    args project.property('output'), project.findProperty('count') ?: '54',
         project.findProperty('seed') ?: '42', project.property('asOf'),
         project.findProperty('scenario') ?: 'mixed', project.findProperty('complexity') ?: 'mixed'
   }

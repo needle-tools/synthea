@@ -141,6 +141,59 @@ public class OncologyCaseExporterTest {
   }
 
   @Test
+  public void exportsFixedDosesAtTheCorrectPointInTreatment() {
+    var administrations = new java.util.TreeMap<LocalDate, Double>();
+    for (var entry : generate(0, Scenario.TOXICITY, Complexity.COMPLEX).getAsJsonArray("entry")) {
+      var resource = entry.getAsJsonObject().getAsJsonObject("resource");
+      if ("MedicationAdministration".equals(resource.get("resourceType").getAsString())
+          && "pertuzumab".equals(resource.getAsJsonObject("medicationCodeableConcept")
+              .get("text").getAsString())) {
+        var dose = resource.getAsJsonObject("dosage").getAsJsonObject("dose");
+        assertEquals("mg", dose.get("code").getAsString());
+        administrations.put(LocalDate.parse(resource.get("effectiveDateTime").getAsString()),
+            dose.get("value").getAsDouble());
+      }
+    }
+    assertEquals(java.util.List.of(840.0, 420.0), java.util.List.copyOf(administrations.values()));
+    var entries = generate(0, Scenario.LOST_FOLLOWUP, Complexity.STANDARD).getAsJsonArray("entry");
+    var prescription = java.util.stream.StreamSupport.stream(entries.spliterator(), false)
+        .map(entry -> entry.getAsJsonObject().getAsJsonObject("resource"))
+        .filter(r -> r.get("resourceType").getAsString().equals("MedicationRequest"))
+        .findFirst().orElseThrow();
+    var dosage = prescription.getAsJsonArray("dosageInstruction").get(0).getAsJsonObject();
+    var dose = dosage.getAsJsonArray("doseAndRate").get(0).getAsJsonObject()
+        .getAsJsonObject("doseQuantity");
+    assertEquals(2.5, dose.get("value").getAsDouble(), 0);
+    assertEquals("mg", dose.get("code").getAsString());
+    assertEquals("d", dosage.getAsJsonObject("timing").getAsJsonObject("repeat")
+        .get("periodUnit").getAsString());
+  }
+
+  @Test
+  public void sixWeekDelayRestartsBothAntibodiesAtLoadingDoses() {
+    var doses = new HashMap<String, java.util.List<Double>>();
+    var dates = new java.util.ArrayList<LocalDate>();
+    for (var entry : generate(0, Scenario.DELAYED_RESTART, Complexity.SIMPLE)
+        .getAsJsonArray("entry")) {
+      var resource = entry.getAsJsonObject().getAsJsonObject("resource");
+      if (!"MedicationAdministration".equals(resource.get("resourceType").getAsString())
+          || !resource.has("dosage")) {
+        continue;
+      }
+      String drug = resource.getAsJsonObject("medicationCodeableConcept").get("text").getAsString();
+      var dose = resource.getAsJsonObject("dosage").getAsJsonObject("dose");
+      doses.computeIfAbsent(drug, k -> new java.util.ArrayList<>())
+          .add(dose.get("value").getAsDouble());
+      if (drug.equals("pertuzumab")) {
+        dates.add(LocalDate.parse(resource.get("effectiveDateTime").getAsString()));
+      }
+    }
+    assertEquals(java.util.List.of(840.0, 420.0, 840.0), doses.get("pertuzumab"));
+    assertEquals(java.util.List.of(544.0, 402.0, 528.0), doses.get("trastuzumab"));
+    assertEquals(dates.get(1).plusWeeks(6), dates.get(2));
+  }
+
+  @Test
   public void complexityAndSeedsVaryTheJourney() {
     assertTrue(generate(0, Scenario.RECURRENCE, Complexity.COMPLEX).getAsJsonArray("entry").size()
         > generate(0, Scenario.RECURRENCE, Complexity.SIMPLE).getAsJsonArray("entry").size());
