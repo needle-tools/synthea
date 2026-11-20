@@ -250,11 +250,12 @@ public final class OncologyScenario {
       }
       add(events, "lvef-baseline", "lvef", treatment.minusDays(5), "final",
           "Left ventricular ejection fraction", null, "63", null);
+      int baselineWeight = restarting ? 55 + random.nextInt(37) : 0;
       for (int cycle = 0; cycle < completedCycles; cycle++) {
         LocalDate day = treatment.plusDays(cycle * 21L + (restarting && cycle == 2 ? 21 : 0));
         if (restarting) {
           add(events, "weight-" + cycle, "weight", day, "final", "Measured body weight",
-              null, Integer.toString(68 - cycle), null);
+              null, Integer.toString(baselineWeight - cycle), null);
           if (cycle == 2) {
             add(events, "missed-infusion", "assessment", treatment.plusDays(42), "completed",
                 "Cycle three missed during relocation; transfer between treatment centres",

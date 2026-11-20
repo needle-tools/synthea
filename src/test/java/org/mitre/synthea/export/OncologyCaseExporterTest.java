@@ -172,10 +172,20 @@ public class OncologyCaseExporterTest {
   @Test
   public void sixWeekDelayRestartsBothAntibodiesAtLoadingDoses() {
     var doses = new HashMap<String, java.util.List<Double>>();
+    var weights = new java.util.TreeMap<LocalDate, Double>();
     var dates = new java.util.ArrayList<LocalDate>();
     for (var entry : generate(0, Scenario.DELAYED_RESTART, Complexity.SIMPLE)
         .getAsJsonArray("entry")) {
       var resource = entry.getAsJsonObject().getAsJsonObject("resource");
+      if ("Observation".equals(resource.get("resourceType").getAsString()) && resource.has("code")
+          && "Measured body weight".equals(resource.getAsJsonObject("code").get("text")
+              .getAsString())) {
+        var coding = resource.getAsJsonArray("category").get(0).getAsJsonObject()
+            .getAsJsonArray("coding").get(0).getAsJsonObject();
+        assertEquals("vital-signs", coding.get("code").getAsString());
+        weights.put(LocalDate.parse(resource.get("effectiveDateTime").getAsString()),
+            resource.getAsJsonObject("valueQuantity").get("value").getAsDouble());
+      }
       if (!"MedicationAdministration".equals(resource.get("resourceType").getAsString())
           || !resource.has("dosage")) {
         continue;
@@ -189,7 +199,8 @@ public class OncologyCaseExporterTest {
       }
     }
     assertEquals(java.util.List.of(840.0, 420.0, 840.0), doses.get("pertuzumab"));
-    assertEquals(java.util.List.of(544.0, 402.0, 528.0), doses.get("trastuzumab"));
+    assertEquals(java.util.List.of(8 * weights.get(dates.get(0)), 6 * weights.get(dates.get(1)),
+        8 * weights.get(dates.get(2))), doses.get("trastuzumab"));
     assertEquals(dates.get(1).plusWeeks(6), dates.get(2));
   }
 

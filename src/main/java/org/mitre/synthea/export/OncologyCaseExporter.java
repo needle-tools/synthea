@@ -196,6 +196,9 @@ public final class OncologyCaseExporter {
         if (event.kind().equals("ecog")) {
           result.addProperty("valueInteger", Integer.parseInt(event.value()));
         } else if (event.kind().equals("weight")) {
+          result.add("category", array(coded(
+              "http://terminology.hl7.org/CodeSystem/observation-category",
+              "vital-signs", "Vital signs")));
           result.add("valueQuantity", object("value", Double.parseDouble(event.value()),
               "unit", "kg", "system", "http://unitsofmeasure.org", "code", "kg"));
         } else if (event.kind().equals("hemoglobin")) {
