@@ -44,9 +44,12 @@ final class BreastBoardScenario {
   Journey simulate(long seed, int index, Scenario scenario) {
     boolean young = scenario == Scenario.HEREDITARY_REVIEW || scenario == Scenario.RESIDUAL_TNBC;
     final int age = young ? 34 + random.nextInt(8) : 60 + random.nextInt(13);
-    int days = daysFromPresentation(scenario);
+    boolean surveillance = scenario == Scenario.ROUTINE_SURVEILLANCE;
+    boolean endocrineSurvivor = surveillance && random.nextInt(3) == 0;
+    int days = surveillance ? (endocrineSurvivor ? 6 : 3) * 365 + random.nextInt(300)
+        : daysFromPresentation(scenario);
     boolean lowEr = scenario == Scenario.ER_LOW_REVIEW;
-    boolean hr = scenario == Scenario.EQUIVOCAL_HER2 || scenario == Scenario.LATE_LIVER_LESION;
+    boolean hr = endocrineSurvivor || scenario == Scenario.EQUIVOCAL_HER2 || scenario == Scenario.LATE_LIVER_LESION;
     String her2 = scenario == Scenario.EQUIVOCAL_HER2 ? "IHC 2+"
         : young ? "IHC 0" : hr || lowEr ? "IHC 1+" : "IHC 3+";
     String side = random.nextBoolean() ? "Left" : "Right";
@@ -61,7 +64,7 @@ final class BreastBoardScenario {
     tissue("biopsy", "primary", days - 2, side + " breast");
     report("pathology", "primary", days - 6,
         "Invasive breast carcinoma NST, " + (hr ? "G2" : "G3"));
-    boolean priorDisease = scenario == Scenario.HEREDITARY_REVIEW
+    boolean priorDisease = surveillance || scenario == Scenario.HEREDITARY_REVIEW
         || scenario == Scenario.LATE_LIVER_LESION;
     put("diagnosis", "condition", days - 6, priorDisease ? "remission" : "active",
         "Malignant neoplasm of breast", null, null, null);
@@ -81,6 +84,10 @@ final class BreastBoardScenario {
     put("stage", "stage", days - 7, "final", "Clinical TNM", null,
         hr ? "cT1c cN0 cM0" : "cT2 cN1 cM0", null);
     put("ecog", "ecog", days - 7, "final", "ECOG performance status", null, "0", null);
+    if (surveillance) {
+      routineSurveillance(days, hr, size);
+      return finish(seed, index, scenario, days, age);
+    }
     String question;
     String evidence;
     switch (scenario) {
@@ -241,12 +248,121 @@ final class BreastBoardScenario {
             : "biopsy-proven cN1, ER-negative")
         + ", HER2 " + her2 + ", Ki-67 " + ki67 + "%. " + question + ".";
     put("board-summary", "assessment", 0, "completed", summary, null, null, evidence);
+    return finish(seed, index, scenario, days, age);
+  }
+
+  private Journey finish(long seed, int index, Scenario scenario, int days, int age) {
     events.sort(java.util.Comparator.comparing(Event::date));
     Journey result = new Journey(seed, index, scenario, snapshot,
         snapshot.minusDays(days).minusYears(age).minusDays(random.nextInt(365)),
         List.copyOf(events));
     OncologyClinicalValidator.requireValid(result);
     return result;
+  }
+
+  private void routineSurveillance(int days, boolean endocrine, int size) {
+    int end;
+    if (endocrine) {
+      breastSurgery(days - 30, size + " mm invasive NST, clear margins, 0/3 sentinel nodes",
+          "pT1c pN0(sn)");
+      put("adjuvant-board", "board", days - 45, "completed",
+          "Low-risk node-negative disease. Agreed whole-breast radiation and five years of"
+              + " endocrine therapy after breast conservation", null, null, "resection");
+      course("rt", days - 60, days - 81, "Adjuvant whole-breast radiotherapy");
+      LocalDate start = snapshot.minusDays(days - 85);
+      end = (int) java.time.temporal.ChronoUnit.DAYS.between(start.plusYears(5), snapshot);
+      course("endocrine", days - 85, end, "Completed five years of adjuvant letrozole");
+    } else {
+      end = completedHer2Treatment(days);
+    }
+    put("completion", "assessment", end, "completed",
+        "All planned anticancer therapy completed. Treatment summary and follow-up plan agreed",
+        null, null, endocrine ? "endocrine" : "continuation");
+    // Annual bilateral mammography after breast conservation, including years on treatment.
+    int imagingDay = days - (endocrine ? 365 : 405);
+    String latest = null;
+    while (imagingDay >= 0) {
+      latest = "surveillance-mammogram-" + imagingDay;
+      put(latest, "mammography", imagingDay, "final",
+          "Bilateral surveillance mammogram: stable postoperative changes, BI-RADS 2",
+          null, null, null);
+      imagingDay = (int) java.time.temporal.ChronoUnit.DAYS.between(
+          snapshot.minusDays(imagingDay).plusYears(1), snapshot);
+    }
+    put("board-summary", "assessment", 0, "completed",
+        "Well at follow-up. Breast and nodal examination unremarkable; no clinical or"
+            + " mammographic evidence of recurrence. Routine surveillance continues",
+        null, null, latest);
+    put("surveillance-plan", "follow-up-plan", 0, "active",
+        "Routine breast follow-up: clinical review and annual bilateral mammography."
+            + " Contact the breast team sooner for new symptoms", null, null, "board-summary");
+    put("next-mammogram", "scheduled-imaging", 0, "active",
+        "Bilateral surveillance mammogram", null, snapshot.minusDays(imagingDay).toString(),
+        "surveillance-plan");
+    task("followup", 0, "CASE_MANAGER", "Arrange next routine surveillance mammogram",
+        "next-mammogram");
+  }
+
+  private int completedHer2Treatment(int days) {
+    boolean residual = random.nextBoolean();
+    put("baseline-echo", "lvef", days - 12, "final", "Baseline LVEF", null, "63", null);
+    course("tchp", days - 20, days - 125, "Six neoadjuvant TCHP cycles");
+    int op = days - 160;
+    breastSurgery(op, residual
+        ? "Residual invasive carcinoma 14 mm, margins clear, 1/12 nodes with macrometastasis"
+        : "No residual invasive or in situ disease; breast margins and clipped node clear",
+        residual ? "ypT1c ypN1a" : "ypT0 ypN0");
+    put("adjuvant-board", "board", op - 10, "completed", residual
+        ? "Residual invasive HER2-positive disease. Switch to 14 cycles of adjuvant T-DM1"
+        : "Pathological complete response. Complete one year of HER2-directed therapy",
+        null, null, "resection");
+    course("rt", op - 35, op - 57, "Adjuvant breast and regional nodal radiotherapy");
+    int end = days - 377;
+    if (residual) {
+      end = completedTdm1(op - 23);
+    } else {
+      course("continuation", days - 146, end,
+          "Completed adjuvant trastuzumab and pertuzumab after pathological complete response");
+    }
+    for (int echo = days - 96; echo >= end; echo -= 84) {
+      put("echo-" + echo, "lvef", echo, "final", "Surveillance LVEF", null,
+          Integer.toString(58 + random.nextInt(8)), null);
+    }
+    return end;
+  }
+
+  private int completedTdm1(int first) {
+    int delayedCycle = 3 + random.nextInt(7);
+    int weight = 58 + random.nextInt(28);
+    put("tdm1-order", "medication-order", first + 3, "completed",
+        "Adjuvant IV trastuzumab emtansine, 14 cycles", null, "trastuzumab emtansine",
+        "adjuvant-board");
+    int day = first;
+    for (int cycle = 1; cycle <= 14; cycle++) {
+      if (cycle == delayedCycle) {
+        put("low-platelets", "platelets", day, "final", "Platelet count", null,
+            Integer.toString(45 + random.nextInt(20)), null);
+        put("hold", "assessment", day, "completed",
+            "T-DM1 withheld for thrombocytopenia on scheduled infusion day",
+            null, null, "low-platelets");
+        day -= 7;
+      }
+      put("platelets-" + cycle, "platelets", day, "final", "Pre-infusion platelet count",
+          null, Integer.toString(120 + random.nextInt(100)), null);
+      if (cycle == delayedCycle) {
+        put("restart", "assessment", day, "completed",
+            "Platelets recovered. Reviewed results and resumed T-DM1 at the same dose level",
+            null, null, "platelets-" + cycle);
+      }
+      put("weight-" + cycle, "weight", day, "final", "Measured body weight",
+          null, Integer.toString(weight), null);
+      put("tdm1-" + cycle, "medication", day, "completed",
+          "Adjuvant T-DM1 cycle " + cycle + " of 14", null, "trastuzumab emtansine", "tdm1-order");
+      day -= 21;
+    }
+    int last = day + 21;
+    course("continuation", first, last, "Completed 14 cycles of adjuvant trastuzumab emtansine");
+    return last;
   }
 
   private String outstandingEvidence(Scenario scenario) {

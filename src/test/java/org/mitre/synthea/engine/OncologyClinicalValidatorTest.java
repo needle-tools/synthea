@@ -222,6 +222,44 @@ public class OncologyClinicalValidatorTest {
   }
 
   @Test
+  public void remissionAfterDifferentTreatmentHistoriesRequiresCompletedCare() {
+    var routes = new java.util.HashSet<String>();
+    for (int i = 0; i < 60; i++) {
+      Journey patient = OncologyScenario.simulate(197, i, SNAPSHOT, Scenario.ROUTINE_SURVEILLANCE);
+      var events = patient.events();
+      String route = events.stream().filter(e -> e.key().equals("post-stage")).findFirst()
+          .orElseThrow().value();
+      if (!routes.add(route)) {
+        continue;
+      }
+      rejects(patient, "annual-surveillance", candidate -> {
+        candidate.removeIf(e -> e.key().equals("next-mammogram"));
+        return candidate;
+      });
+      rejects(patient, "surveillance-only", candidate -> {
+        candidate.add(new Event("pending-biopsy", "investigation", SNAPSHOT, "active",
+            "Biopsy of new lesion", null, null, null));
+        return candidate;
+      });
+      if (events.stream().anyMatch(e -> e.key().equals("hold"))) {
+        rejects(patient, "tdm1-infusion-readiness", candidate -> {
+          candidate.replaceAll(e -> e.key().equals("platelets-14") ? change(e, e.date(), "43") : e);
+          return candidate;
+        });
+        rejects(patient, "tdm1-recovery-before-restart", candidate -> {
+          candidate.removeIf(e -> e.key().equals("restart"));
+          return candidate;
+        });
+        rejects(patient, "completed-tdm1-course", candidate -> {
+          candidate.removeIf(e -> e.key().equals("tdm1-14"));
+          return candidate;
+        });
+      }
+    }
+    assertEquals(java.util.Set.of("pT1c pN0(sn) cM0", "ypT0 ypN0 cM0", "ypT1c ypN1a cM0"), routes);
+  }
+
+  @Test
   public void everyDocumentedTchpCycleRetainsItsMonitoring() {
     for (Scenario scenario : List.of(Scenario.UNCOMPLICATED, Scenario.TOXICITY,
         Scenario.DELAYED_RESTART)) {

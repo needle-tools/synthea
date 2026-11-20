@@ -2,15 +2,16 @@
 
 `oncologyCases` produces deliberately sampled longitudinal breast-cancer cases.
 Every simulation and export must pass `OncologyClinicalValidator`; a contradiction
-aborts generation. The manifest identifies `oncology-v4` and `breast-scenarios-v4`.
+aborts generation. The manifest identifies `oncology-v4.1` and `breast-scenarios-v4.1`.
 Use an empty output directory when regenerating a cohort.
 
-Each file stops at a specific board decision. The model deliberately samples
+Each file stops at a clinical decision or a routine surveillance visit. The model deliberately samples
 these situations for interface testing. Scenario frequencies have no population
 interpretation. The clinical basis is the 2025 treatment context.
 
 | Board situation | Evidence in the file |
 | --- | --- |
+| Routine surveillance in remission | Completed treatment plan, benign bilateral mammography, current clinical examination and a separate active follow-up plan with the next mammogram due |
 | Equivocal primary HER2 | IHC 2+ on a specified core, followed by a pending reflex ISH order or a completed order with the amplification result on that core |
 | Node-positive HER2-positive disease during TCHP | Clipped biopsy-positive node, baseline cardiac function, first cycle and planned interim ultrasound |
 | Postoperative residual triple-negative disease | Weekly taxane and carboplatin with pembrolizumab, then EC with pembrolizumab, preoperative response, residual nodal disease and pending RCB addendum |
@@ -72,6 +73,15 @@ partial historical dates, concordant metastatic recurrence and routine care.
   order or to the completed addendum on the original core.
   [ASCO/CAP HER2 testing algorithms, figures 1 and 3](https://documents.cap.org/documents/her2_breast_update_algorithms_2023.pdf)
 
+The surveillance cohort includes node-negative ER-positive disease after five years
+of letrozole, a HER2-positive complete response after TCHP and antibody continuation,
+and residual HER2-positive disease after neoadjuvant therapy. In the residual-disease
+course a low platelet count delays one of 14 adjuvant T-DM1 cycles. Repeat counts
+document recovery before treatment resumes. Each survivor has a dated examination
+and a follow-up plan for annual bilateral mammography after breast conservation.
+[EMA trastuzumab emtansine product information, section 4.2](https://www.ema.europa.eu/en/documents/product-information/kadcyla-epar-product-information_en.pdf)
+and [AGO breast cancer follow-up recommendations](https://www.ago-online.de/fileadmin/ago-online/downloads/_leitlinien/kommission_mamma/2024/Einzeldateien/AGO_2024D_16_Nachsorge.pdf).
+
 ## Executable checks
 
 The gate checks specimen/result chronology, diagnostic prerequisites, regimen
@@ -88,7 +98,7 @@ patient-specific events can still vary as appropriate. Recorded monitoring
 accompanies each individually modeled infusion cycle. The lost-follow-up case
 records uncertainty about endocrine adherence.
 
-Tests sweep seeds across all 18 scenarios, mutate otherwise
+Tests sweep seeds across all 19 scenarios, mutate otherwise
 valid cases to ensure clinically contradictory controls are rejected, and parse
 exported FHIR with resolved references. FHIR import validation and browser tests
 are separate checks of the representation and its consumers. The clinical checks

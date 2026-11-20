@@ -184,8 +184,89 @@ public final class OncologyClinicalValidator {
             && !e.date().isBefore(byKey.get("followup").date())), "followup-uncertainty", issues);
       }
     }
+    if (journey.scenario() == Scenario.ROUTINE_SURVEILLANCE) {
+      validateSurveillance(journey, byKey, issues);
+    }
     validateBoardSnapshot(journey, byKey, issues);
     return List.copyOf(issues);
+  }
+
+  private static void validateSurveillance(Journey journey, Map<String, Event> events,
+      List<String> issues) {
+    Event completion = events.get("completion");
+    Event diagnosis = events.get("diagnosis");
+    check(diagnosis != null && diagnosis.status().equals("remission"), "surveillance-remission", issues);
+    before(events, "operation", "resection", "survivor-resection", issues);
+    completedBefore(events, "rt", "completion", issues);
+    before(events, "completion", "surveillance-plan", "surveillance-after-treatment", issues);
+    check(events.values().stream().filter(e -> Set.of("active", "on-hold", "requested", "draft")
+        .contains(e.status())).allMatch(e -> Set.of("surveillance-plan", "next-mammogram", "followup")
+        .contains(e.key())), "surveillance-only", issues);
+    for (Event e : events.values()) {
+      if (e.kind().equals("course")) {
+        check(e.status().equals("completed"), "survivor-course-complete", issues);
+        completedBefore(events, e.key(), "completion", issues);
+      } else if (e.kind().equals("medication")) {
+        check(completion != null && !e.date().isAfter(completion.date()),
+            "surveillance-after-treatment", issues);
+      }
+    }
+    Event latest = events.values().stream().filter(e -> e.kind().equals("mammography"))
+        .max(java.util.Comparator.comparing(Event::date)).orElse(null);
+    Event request = events.get("next-mammogram");
+    check(latest != null && request != null && pending(events, "next-mammogram")
+        && latest.date().plusYears(1).isAfter(journey.asOf())
+        && latest.date().plusYears(1).toString().equals(request.value())
+        && "surveillance-plan".equals(request.cause()) && pending(events, "surveillance-plan"),
+        "annual-surveillance", issues);
+    before(events, "next-mammogram", "followup", "surveillance-followup", issues);
+    if (value(events, "primary-er", "Positive")) {
+      Event endocrine = events.get("endocrine");
+      check(value(events, "primary-her2", "IHC 1+") && value(events, "post-stage", "pT1c pN0(sn) cM0")
+          && endocrine != null && endocrine.date().plusYears(5).toString().equals(endocrine.value()),
+          "completed-endocrine-course", issues);
+      return;
+    }
+    check(value(events, "primary-her2", "IHC 3+"), "survivor-her2-eligibility", issues);
+    completedBefore(events, "tchp", "operation", issues);
+    before(events, "resection", "adjuvant-board", "adjuvant-pathology", issues);
+    completedBefore(events, "continuation", "completion", issues);
+    if (value(events, "post-stage", "ypT0 ypN0 cM0")) {
+      check(!events.containsKey("tdm1-order"), "pcr-continuation", issues);
+      return;
+    }
+    check(value(events, "post-stage", "ypT1c ypN1a cM0"), "tdm1-residual-disease", issues);
+    var infusions = events.values().stream().filter(e -> e.kind().equals("medication")
+        && e.value().equals("trastuzumab emtansine")).sorted(java.util.Comparator.comparing(Event::date))
+        .toList();
+    check(infusions.size() == 14, "completed-tdm1-course", issues);
+    Event hold = events.get("hold");
+    Event low = events.get("low-platelets");
+    var findings = List.copyOf(events.values());
+    boolean resumed = false;
+    for (int i = 0; i < infusions.size(); i++) {
+      Event infusion = infusions.get(i);
+      check(recentResult(findings, "platelets", infusion, 0, 75)
+          && recentResult(findings, "weight", infusion, 0, 1),
+          "tdm1-infusion-readiness", issues);
+      if (i > 0) {
+        var scheduled = infusions.get(i - 1).date().plusWeeks(3);
+        if (hold != null && hold.date().equals(scheduled)) {
+          Event review = events.get("restart");
+          resumed = low != null && low.date().equals(scheduled) && Double.parseDouble(low.value()) < 75
+              && review != null && review.date().equals(infusion.date())
+              && infusion.date().equals(scheduled.plusWeeks(1));
+        } else {
+          check(infusion.date().equals(scheduled), "tdm1-cycle-interval", issues);
+        }
+      }
+    }
+    check(resumed, "tdm1-recovery-before-restart", issues);
+    if (!infusions.isEmpty()) {
+      Event last = infusions.get(infusions.size() - 1);
+      check(completion != null && last.date().equals(completion.date()),
+          "tdm1-completion-date", issues);
+    }
   }
 
   private static void validateBoardSnapshot(Journey journey, Map<String, Event> events,

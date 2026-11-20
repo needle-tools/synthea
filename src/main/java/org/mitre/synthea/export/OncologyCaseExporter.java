@@ -221,11 +221,23 @@ public final class OncologyCaseExporter {
           result.add("specimen", ref(specimens.get(event.sample())));
         }
         break;
+      case "mammography":
       case "imaging":
         result = add("DiagnosticReport", event.key(), "status", event.status(),
-            "subject", ref(patient), "effectiveDateTime", date, "code", concept("Staging imaging"),
+            "subject", ref(patient), "effectiveDateTime", date, "code", concept(event.kind().equals("mammography")
+                ? "Bilateral surveillance mammogram" : "Staging imaging"),
             "conclusion", event.description(), "category", array(coded(
                 "http://terminology.hl7.org/CodeSystem/v2-0074", "RAD", "Radiology")));
+        break;
+      case "scheduled-imaging":
+        result = add("ServiceRequest", event.key(), "status", event.status(), "intent", "order",
+            "subject", ref(patient), "code", concept(event.description()), "authoredOn", date,
+            "occurrenceDateTime", event.value());
+        break;
+      case "follow-up-plan":
+        result = add("CarePlan", event.key(), "status", event.status(), "intent", "plan",
+            "subject", ref(patient), "title", "Routine surveillance", "created", date,
+            "description", event.description());
         break;
       case "board":
         result = add("CarePlan", event.key(), "status", event.status(), "intent", "plan",
@@ -277,6 +289,14 @@ public final class OncologyCaseExporter {
             "context", ref(episode),
             "medicationCodeableConcept", concept(event.value()),
             "note", array(object("text", event.description())));
+        if ("trastuzumab emtansine".equals(event.value())) {
+          Event weight = journey.events().stream().filter(e -> e.kind().equals("weight")
+              && e.date().equals(event.date())).findFirst().orElseThrow();
+          double dose = Integer.parseInt(weight.value()) * 36 / 10.0;
+          result.add("dosage", object("route", concept("Intravenous infusion"),
+              "dose", milligrams(dose)));
+          break;
+        }
         boolean weightedInfusion = journey.scenario() == Scenario.DELAYED_RESTART
             && event.value().equals("trastuzumab");
         if ("pertuzumab".equals(event.value()) || weightedInfusion) {
@@ -321,13 +341,24 @@ public final class OncologyCaseExporter {
             array(JSON.toJsonTree("Case " + (journey.index() + 1)))))));
     episode = reference(add("EpisodeOfCare", "episode", "status", "active", "patient", ref(patient),
         "type", array(coded(WORKBENCH + "case-family", "BREAST", "Breast oncology"))));
-    JsonObject pathway = add("CarePlan", "pathway", "status", "active", "intent", "plan",
-        "subject", ref(patient), "title", journey.scenario().name(),
+    boolean inSurveillance = journey.scenario() == Scenario.ROUTINE_SURVEILLANCE;
+    JsonObject pathway = add("CarePlan", "pathway", "status", inSurveillance ? "completed" : "active",
+        "intent", "plan",
+        "subject", ref(patient), "title", inSurveillance ? "Primary breast cancer treatment"
+            : journey.scenario().name(),
         "description", "Synthetic breast oncology journey; snapshot " + journey.asOf(),
         "category", array(coded(WORKBENCH + "workflow", "pathway", "Therapy pathway")),
         "extension", array(object("url", EPISODE_EXTENSION, "valueReference", ref(episode))));
     for (Event event : journey.events()) {
       event(event);
+    }
+    if (inSurveillance) {
+      Event completion = journey.events().stream().filter(e -> e.key().equals("completion"))
+          .findFirst().orElseThrow();
+      pathway.add("period", object("end", completion.date().toString()));
+      JsonObject surveillance = resources.get(eventRefs.get("surveillance-plan"));
+      surveillance.add("addresses", array(ref(eventRefs.get("diagnosis"))));
+      surveillance.add("activity", array(object("reference", ref(eventRefs.get("next-mammogram")))));
     }
     // Connect reports, completed work and dependent activities after all events exist.
     for (Event event : journey.events()) {
@@ -375,6 +406,7 @@ public final class OncologyCaseExporter {
         case "molecular-report":
         case "therapy":
         case "therapy-request":
+        case "scheduled-imaging":
         case "medication-order":
           resource.add("basedOn", array(ref(cause)));
           break;
@@ -385,6 +417,7 @@ public final class OncologyCaseExporter {
           resource.add("basedOn", array(ref(cause)));
           break;
         case "board":
+        case "follow-up-plan":
         case "assessment":
           resource.add("supportingInfo", array(ref(cause)));
           break;
@@ -409,10 +442,16 @@ public final class OncologyCaseExporter {
     JsonArray notes = new JsonArray();
     for (Event item : journey.events()) {
       if (item.kind().equals("task")) {
-        resources.get(eventRefs.get(item.key())).add("basedOn", array(ref(reference(pathway))));
+        JsonObject task = resources.get(eventRefs.get(item.key()));
+        String plan = inSurveillance ? eventRefs.get("surveillance-plan") : reference(pathway);
+        task.add("basedOn", array(ref(plan)));
+        JsonObject request = resources.get(eventRefs.get(item.cause()));
+        if (request != null && request.has("occurrenceDateTime")) {
+          task.add("restriction", object("period", object("end", request.get("occurrenceDateTime"))));
+        }
       }
       if (item.date().isBefore(since) || !java.util.Set.of("report", "molecular-report", "imaging", "problem",
-          "molecular", "investigation", "board", "medication-order").contains(item.kind())) {
+          "molecular", "investigation", "board", "medication-order", "mammography", "follow-up-plan").contains(item.kind())) {
         continue;
       }
       updates.add(object("item", ref(eventRefs.get(item.key()))));
@@ -479,8 +518,8 @@ public final class OncologyCaseExporter {
       cases.add(object("file", filename, "scenario", journey.scenario().name(),
           "resources", bundle.getAsJsonArray("entry").size()));
     }
-    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v4",
-        "clinicalContract", "breast-scenarios-v4", "clinicalValidation", "passed",
+    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v4.1",
+        "clinicalContract", "breast-scenarios-v4.1", "clinicalValidation", "passed",
         "seed", seed, "asOf", asOf.toString(), "cases", cases)) + "\n", StandardCharsets.UTF_8,
         java.nio.file.StandardOpenOption.CREATE_NEW);
     System.out.println("Generated " + count + " synthetic oncology case files in " + output);

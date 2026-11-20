@@ -48,7 +48,8 @@ public class OncologyCaseExporterTest {
       element.getAsJsonArray().forEach(child -> referencesResolve(child, identities));
     } else if (element.isJsonObject()) {
       JsonObject object = element.getAsJsonObject();
-      if (object.has("reference")) {
+      // A CarePlan.activity.reference contains a Reference whose own reference is the URI.
+      if (object.has("reference") && object.get("reference").isJsonPrimitive()) {
         assertTrue(object.get("reference").getAsString(),
             identities.contains(object.get("reference").getAsString()));
       }
@@ -199,6 +200,34 @@ public class OncologyCaseExporterTest {
     assertEquals(java.util.List.of(8 * weights.get(dates.get(0)), 6 * weights.get(dates.get(1)),
         8 * weights.get(dates.get(2))), doses.get("trastuzumab"));
     assertEquals(dates.get(1).plusWeeks(6), dates.get(2));
+  }
+
+  @Test
+  public void routineSurveillanceHasItsOwnPlanOrderAndFutureDueDate() {
+    for (int index = 0; index < 12; index++) {
+      Map<String, JsonObject> resources = new HashMap<>();
+      for (var entry : generate(index, Scenario.ROUTINE_SURVEILLANCE).getAsJsonArray("entry")) {
+        var r = entry.getAsJsonObject().getAsJsonObject("resource");
+        resources.put(r.get("resourceType").getAsString() + "/" + r.get("id").getAsString(), r);
+      }
+      var task = resources.values().stream().filter(r -> "Task".equals(r.get("resourceType")
+          .getAsString())).findFirst().orElseThrow();
+      var plan = resources.get(task.getAsJsonArray("basedOn").get(0).getAsJsonObject()
+          .get("reference").getAsString());
+      assertEquals("active", plan.get("status").getAsString());
+      var order = resources.get(plan.getAsJsonArray("activity").get(0).getAsJsonObject()
+          .getAsJsonObject("reference").get("reference").getAsString());
+      var due = order.get("occurrenceDateTime").getAsString();
+      assertTrue(LocalDate.parse(due).isAfter(SNAPSHOT));
+      assertEquals(due, task.getAsJsonObject("restriction").getAsJsonObject("period")
+          .get("end").getAsString());
+      var treatment = resources.values().stream().filter(r -> r.has("title")
+          && r.get("title").getAsString().equals("Primary breast cancer treatment"))
+          .findFirst().orElseThrow();
+      assertEquals("completed", treatment.get("status").getAsString());
+      assertTrue(LocalDate.parse(treatment.getAsJsonObject("period").get("end").getAsString())
+          .isBefore(SNAPSHOT));
+    }
   }
 
   @Test
