@@ -15,33 +15,30 @@ import java.util.Map;
 import java.util.Set;
 import org.junit.Test;
 import org.mitre.synthea.engine.OncologyScenario;
-import org.mitre.synthea.engine.OncologyScenario.Complexity;
 import org.mitre.synthea.engine.OncologyScenario.Scenario;
 
 public class OncologyCaseExporterTest {
   private static final LocalDate SNAPSHOT = LocalDate.of(2025, 6, 30);
 
-  private JsonObject generate(int index, Scenario scenario, Complexity complexity) {
+  private JsonObject generate(int index, Scenario scenario) {
     return OncologyCaseExporter.export(OncologyScenario.simulate(42, index,
-        SNAPSHOT, scenario, complexity));
+        SNAPSHOT, scenario));
   }
 
   @Test
-  public void everyScenarioAndDepthHasAClosedReadableGraph() {
+  public void everyScenarioHasAClosedReadableGraph() {
     for (Scenario scenario : Scenario.values()) {
-      for (Complexity complexity : Complexity.values()) {
-        for (int seed = 0; seed < 10; seed++) {
-          JsonObject bundle = generate(seed, scenario, complexity);
-          Set<String> identities = new HashSet<>();
-          for (JsonElement entry : bundle.getAsJsonArray("entry")) {
-            JsonObject resource = entry.getAsJsonObject().getAsJsonObject("resource");
-            assertTrue(identities.add(resource.get("resourceType").getAsString()
-                + "/" + resource.get("id").getAsString()));
-          }
-          referencesResolve(bundle, identities);
-          FhirContext.forR4Cached().newJsonParser().parseResource(bundle.toString());
-          assertEquals(bundle, generate(seed, scenario, complexity));
+      for (int seed = 0; seed < 10; seed++) {
+        JsonObject bundle = generate(seed, scenario);
+        Set<String> identities = new HashSet<>();
+        for (JsonElement entry : bundle.getAsJsonArray("entry")) {
+          JsonObject resource = entry.getAsJsonObject().getAsJsonObject("resource");
+          assertTrue(identities.add(resource.get("resourceType").getAsString()
+              + "/" + resource.get("id").getAsString()));
         }
+        referencesResolve(bundle, identities);
+        FhirContext.forR4Cached().newJsonParser().parseResource(bundle.toString());
+        assertEquals(bundle, generate(seed, scenario));
       }
     }
   }
@@ -62,8 +59,8 @@ public class OncologyCaseExporterTest {
   @Test
   public void simulationMaintainsClinicalAndTemporalRelationships() {
     for (Scenario scenario : Scenario.values()) {
-      for (Complexity complexity : Complexity.values()) {
-        var journey = OncologyScenario.simulate(42, 0, SNAPSHOT, scenario, complexity);
+      for (int patient = 0; patient < 3; patient++) {
+        var journey = OncologyScenario.simulate(42, patient, SNAPSHOT, scenario);
         var events = journey.events();
         for (int index = 0; index < events.size(); index++) {
           var event = events.get(index);
@@ -106,7 +103,7 @@ public class OncologyCaseExporterTest {
 
   @Test
   public void exportsClinicalTreatmentAndSafetyEvidenceAsLinkedFhir() {
-    JsonObject bundle = generate(0, Scenario.TOXICITY, Complexity.SIMPLE);
+    JsonObject bundle = generate(0, Scenario.TOXICITY);
     Map<String, JsonObject> resources = new HashMap<>();
     for (JsonElement entry : bundle.getAsJsonArray("entry")) {
       JsonObject resource = entry.getAsJsonObject().getAsJsonObject("resource");
@@ -143,7 +140,7 @@ public class OncologyCaseExporterTest {
   @Test
   public void exportsFixedDosesAtTheCorrectPointInTreatment() {
     var administrations = new java.util.TreeMap<LocalDate, Double>();
-    for (var entry : generate(0, Scenario.TOXICITY, Complexity.COMPLEX).getAsJsonArray("entry")) {
+    for (var entry : generate(0, Scenario.TOXICITY).getAsJsonArray("entry")) {
       var resource = entry.getAsJsonObject().getAsJsonObject("resource");
       if ("MedicationAdministration".equals(resource.get("resourceType").getAsString())
           && "pertuzumab".equals(resource.getAsJsonObject("medicationCodeableConcept")
@@ -155,7 +152,7 @@ public class OncologyCaseExporterTest {
       }
     }
     assertEquals(java.util.List.of(840.0, 420.0), java.util.List.copyOf(administrations.values()));
-    var entries = generate(0, Scenario.LOST_FOLLOWUP, Complexity.STANDARD).getAsJsonArray("entry");
+    var entries = generate(0, Scenario.LOST_FOLLOWUP).getAsJsonArray("entry");
     var prescription = java.util.stream.StreamSupport.stream(entries.spliterator(), false)
         .map(entry -> entry.getAsJsonObject().getAsJsonObject("resource"))
         .filter(r -> r.get("resourceType").getAsString().equals("MedicationRequest"))
@@ -174,7 +171,7 @@ public class OncologyCaseExporterTest {
     var doses = new HashMap<String, java.util.List<Double>>();
     var weights = new java.util.TreeMap<LocalDate, Double>();
     var dates = new java.util.ArrayList<LocalDate>();
-    for (var entry : generate(0, Scenario.DELAYED_RESTART, Complexity.SIMPLE)
+    for (var entry : generate(0, Scenario.DELAYED_RESTART)
         .getAsJsonArray("entry")) {
       var resource = entry.getAsJsonObject().getAsJsonObject("resource");
       if ("Observation".equals(resource.get("resourceType").getAsString()) && resource.has("code")
@@ -205,12 +202,31 @@ public class OncologyCaseExporterTest {
   }
 
   @Test
-  public void complexityAndSeedsVaryTheJourney() {
-    assertTrue(generate(0, Scenario.RECURRENCE, Complexity.COMPLEX).getAsJsonArray("entry").size()
-        > generate(0, Scenario.RECURRENCE, Complexity.SIMPLE).getAsJsonArray("entry").size());
-    assertNotEquals(generate(0, Scenario.UNCOMPLICATED, Complexity.STANDARD),
-        generate(1, Scenario.UNCOMPLICATED, Complexity.STANDARD));
-    var partial = generate(0, Scenario.PARTIAL_DATES, Complexity.STANDARD);
+  public void mixedPatientsAreReproducibleAndHaveDifferentClinicalCourses() {
+    var pathways = new java.util.ArrayList<Scenario>();
+    var otherSeed = new java.util.ArrayList<Scenario>();
+    var patients = new HashSet<String>();
+    for (int index = 0; index < 60; index++) {
+      var journey = OncologyScenario.simulate(42, index, SNAPSHOT);
+      pathways.add(journey.scenario());
+      otherSeed.add(OncologyScenario.simulate(73, index, SNAPSHOT).scenario());
+      var bundle = OncologyCaseExporter.export(journey);
+      assertEquals(generate(index, journey.scenario()), bundle);
+      var patientIds = java.util.stream.StreamSupport.stream(
+          bundle.getAsJsonArray("entry").spliterator(), false)
+          .map(e -> e.getAsJsonObject().getAsJsonObject("resource"))
+          .filter(r -> r.get("resourceType").getAsString().equals("Patient"))
+          .map(r -> r.get("id").getAsString()).toList();
+      assertEquals(1, patientIds.size());
+      assertTrue(patients.add(patientIds.get(0)));
+    }
+    assertTrue(pathways.containsAll(java.util.List.of(Scenario.UNCOMPLICATED, Scenario.TOXICITY)));
+    assertNotEquals(pathways, otherSeed);
+  }
+
+  @Test
+  public void partialHistoricalDatesRetainTheirPrecision() {
+    var partial = generate(0, Scenario.PARTIAL_DATES);
     boolean foundPartialDate = false;
     for (var entry : partial.getAsJsonArray("entry")) {
       var resource = entry.getAsJsonObject().getAsJsonObject("resource");

@@ -16,7 +16,6 @@ import java.util.Map;
 import java.util.UUID;
 import org.mitre.synthea.engine.OncologyClinicalValidator;
 import org.mitre.synthea.engine.OncologyScenario;
-import org.mitre.synthea.engine.OncologyScenario.Complexity;
 import org.mitre.synthea.engine.OncologyScenario.Event;
 import org.mitre.synthea.engine.OncologyScenario.Journey;
 import org.mitre.synthea.engine.OncologyScenario.Scenario;
@@ -79,8 +78,8 @@ public final class OncologyCaseExporter {
   }
 
   private String id(String key) {
-    return UUID.nameUUIDFromBytes(("oncology-v3:" + journey.seed() + ":" + journey.index()
-        + ":" + journey.scenario() + ":" + journey.complexity() + ":" + journey.asOf()
+    return UUID.nameUUIDFromBytes(("oncology-v4:" + journey.seed() + ":" + journey.index()
+        + ":" + journey.scenario() + ":" + journey.asOf()
         + ":" + key).getBytes(StandardCharsets.UTF_8)).toString();
   }
 
@@ -144,10 +143,15 @@ public final class OncologyCaseExporter {
           result.add("specimen", array(ref(specimens.get(event.sample()))));
         }
         break;
+      case "molecular-report":
       case "report":
         result = add("DiagnosticReport", event.key(), "status", event.status(),
-            "subject", ref(patient), "code", concept("Histology"), "effectiveDateTime", date,
+            "subject", ref(patient), "code", concept(event.kind().equals("molecular-report")
+                ? "HER2 dual-probe in situ hybridization" : "Histology"), "effectiveDateTime", date,
             "specimen", array(ref(specimens.get(event.sample()))));
+        if (event.kind().equals("molecular-report")) {
+          result.add("conclusionCode", array(concept(event.value())));
+        }
         if (event.status().equals("final")) {
           result.addProperty("conclusion", event.description());
         }
@@ -319,8 +323,7 @@ public final class OncologyCaseExporter {
         "type", array(coded(WORKBENCH + "case-family", "BREAST", "Breast oncology"))));
     JsonObject pathway = add("CarePlan", "pathway", "status", "active", "intent", "plan",
         "subject", ref(patient), "title", journey.scenario().name(),
-        "description", "Synthetic " + journey.complexity().name().toLowerCase(Locale.ROOT)
-            + " scenario; snapshot " + journey.asOf(),
+        "description", "Synthetic breast oncology journey; snapshot " + journey.asOf(),
         "category", array(coded(WORKBENCH + "workflow", "pathway", "Therapy pathway")),
         "extension", array(object("url", EPISODE_EXTENSION, "valueReference", ref(episode))));
     for (Event event : journey.events()) {
@@ -369,6 +372,7 @@ public final class OncologyCaseExporter {
           resource.add(completed ? "output" : "input", parameters);
           break;
         case "report":
+        case "molecular-report":
         case "therapy":
         case "therapy-request":
         case "medication-order":
@@ -407,7 +411,7 @@ public final class OncologyCaseExporter {
       if (item.kind().equals("task")) {
         resources.get(eventRefs.get(item.key())).add("basedOn", array(ref(reference(pathway))));
       }
-      if (item.date().isBefore(since) || !java.util.Set.of("report", "imaging", "problem",
+      if (item.date().isBefore(since) || !java.util.Set.of("report", "molecular-report", "imaging", "problem",
           "molecular", "investigation", "board", "medication-order").contains(item.kind())) {
         continue;
       }
@@ -440,11 +444,11 @@ public final class OncologyCaseExporter {
     return new OncologyCaseExporter(journey).bundle();
   }
 
-  /** CLI: OUTPUT COUNT SEED AS_OF [mixed|SCENARIO] [mixed|COMPLEXITY]. */
+  /** CLI: OUTPUT COUNT SEED AS_OF [mixed|SCENARIO]. */
   public static void main(String[] args) throws IOException {
-    if (args.length < 4 || args.length > 6) {
+    if (args.length < 4 || args.length > 5) {
       throw new IllegalArgumentException(
-          "OUTPUT COUNT SEED AS_OF [mixed|SCENARIO] [mixed|COMPLEXITY]");
+          "OUTPUT COUNT SEED AS_OF [mixed|SCENARIO]");
     }
     Path output = Path.of(args[0]);
     int count = Integer.parseInt(args[1]);
@@ -454,7 +458,8 @@ public final class OncologyCaseExporter {
       throw new IllegalArgumentException("Count must be between 1 and 10000");
     }
     String scenario = args.length > 4 ? args[4] : "mixed";
-    String complexity = args.length > 5 ? args[5] : "mixed";
+    Scenario focus = scenario.equals("mixed") ? null
+        : Scenario.valueOf(scenario.toUpperCase(Locale.ROOT).replace('-', '_'));
     Files.createDirectories(output);
     try (var existing = Files.list(output)) {
       if (existing.findAny().isPresent()) {
@@ -463,26 +468,19 @@ public final class OncologyCaseExporter {
     }
     JsonArray cases = new JsonArray();
     for (int index = 0; index < count; index++) {
-      Scenario selected = scenario.equals("mixed")
-          ? Scenario.values()[index % Scenario.values().length]
-          : Scenario.valueOf(scenario.toUpperCase(Locale.ROOT).replace('-', '_'));
-      int scenarioCount = scenario.equals("mixed") ? Scenario.values().length : 1;
-      Complexity depth = complexity.equals("mixed")
-          ? Complexity.values()[(index % scenarioCount + index / scenarioCount)
-              % Complexity.values().length]
-          : Complexity.valueOf(complexity.toUpperCase(Locale.ROOT));
-      Journey journey = OncologyScenario.simulate(seed, index, asOf, selected, depth);
+      Journey journey = focus == null ? OncologyScenario.simulate(seed, index, asOf)
+          : OncologyScenario.simulate(seed, index, asOf, focus);
       JsonObject bundle = export(journey);
       String filename = bundle.get("id").getAsString() + ".json";
       Path target = output.resolve(filename);
       // Never replace an existing cohort implicitly.
       Files.writeString(target, JSON.toJson(bundle) + "\n", StandardCharsets.UTF_8,
           java.nio.file.StandardOpenOption.CREATE_NEW);
-      cases.add(object("file", filename, "scenario", selected.name(), "complexity", depth.name(),
+      cases.add(object("file", filename, "scenario", journey.scenario().name(),
           "resources", bundle.getAsJsonArray("entry").size()));
     }
-    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v3",
-        "clinicalContract", "breast-scenarios-v3", "clinicalValidation", "passed",
+    Files.writeString(output.resolve("manifest.json"), JSON.toJson(object("model", "oncology-v4",
+        "clinicalContract", "breast-scenarios-v4", "clinicalValidation", "passed",
         "seed", seed, "asOf", asOf.toString(), "cases", cases)) + "\n", StandardCharsets.UTF_8,
         java.nio.file.StandardOpenOption.CREATE_NEW);
     System.out.println("Generated " + count + " synthetic oncology case files in " + output);

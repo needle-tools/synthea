@@ -2,7 +2,7 @@
 
 `oncologyCases` produces deliberately sampled longitudinal breast-cancer cases.
 Every simulation and export must pass `OncologyClinicalValidator`; a contradiction
-aborts generation. The manifest identifies `oncology-v3` and `breast-scenarios-v3`.
+aborts generation. The manifest identifies `oncology-v4` and `breast-scenarios-v4`.
 Use an empty output directory when regenerating a cohort.
 
 Each file stops at a specific board decision. The model deliberately samples
@@ -11,7 +11,7 @@ interpretation. The clinical basis is the 2025 treatment context.
 
 | Board situation | Evidence in the file |
 | --- | --- |
-| Equivocal primary HER2 | IHC 2+ on a specified core and an outstanding reflex ISH order |
+| Equivocal primary HER2 | IHC 2+ on a specified core, followed by a pending reflex ISH order or a completed order with the amplification result on that core |
 | Node-positive HER2-positive disease during TCHP | Clipped biopsy-positive node, baseline cardiac function, first cycle and planned interim ultrasound |
 | Postoperative residual triple-negative disease | Weekly taxane and carboplatin with pembrolizumab, then EC with pembrolizumab, preoperative response, residual nodal disease and pending RCB addendum |
 | Postoperative residual HER2-positive disease | Six preoperative TCHP cycles, residual invasive disease, radiotherapy referral and adjuvant trastuzumab emtansine discussion |
@@ -64,6 +64,13 @@ partial historical dates, concordant metastatic recurrence and routine care.
 - [ASCO/CAP ER and PgR testing recommendations](https://documents.cap.org/documents/erpgr_summaryrecommendations.pdf).
   The ER-low case reports the staining percentage and controls, retains the
   low-positive interpretation and keeps endocrine benefit open for discussion.
+- After an involved radial margin, a patient may choose re-excision. The new
+  specimen establishes the definitive margin before the final adjuvant plan.
+  [NICE NG101, recommendation 1.4.3](https://www.nice.org.uk/guidance/ng101/chapter/recommendations#further-surgery-after-breast-conserving-surgery)
+- For an equivocal IHC result the simulator samples pending ISH or a definitive
+  dual-probe ISH group 1 or group 5 result. The board links to the outstanding
+  order or to the completed addendum on the original core.
+  [ASCO/CAP HER2 testing algorithms, figures 1 and 3](https://documents.cap.org/documents/her2_breast_update_algorithms_2023.pdf)
 
 ## Executable checks
 
@@ -74,13 +81,14 @@ metastatic staging and reassessment, refusal and pending-result boundaries.
 These constraints apply to these archetypes; they are not universal rules forbidding
 legitimate individualized care in imported patient records.
 
-Complexity adds observations, comorbidity context or linked review work. In a
-complex postoperative case, pathology documentation feeds physician review and
-repeat board scheduling. A completed course retains its length. Partial dates reduce recorded
-precision without changing the underlying clinical sequence. Prescriptions do
-not imply adherence: the lost-follow-up case explicitly records uncertainty.
+The seed determines the presentation and subsequent findings for each patient.
+Routine follow-up is deliberately common in mixed cohorts. Sampling an individual
+scenario fixes the presentation while margins, diagnostic results or other
+patient-specific events can still vary as appropriate. Recorded monitoring
+accompanies each individually modeled infusion cycle. The lost-follow-up case
+records uncertainty about endocrine adherence.
 
-Tests sweep seeds across all 18 scenarios and three depths, mutate otherwise
+Tests sweep seeds across all 18 scenarios, mutate otherwise
 valid cases to ensure clinically contradictory controls are rejected, and parse
 exported FHIR with resolved references. FHIR import validation and browser tests
 are separate checks of the representation and its consumers. The clinical checks
@@ -89,5 +97,5 @@ review or a prescribing system.
 
 ```sh
 ./gradlew test --tests '*Oncology*'
-./gradlew oncologyCases -Poutput=output/breast-cases -Pcount=54 -Pseed=42 -PasOf=2025-06-30
+./gradlew oncologyCases -Poutput=output/breast-cases -Pcount=30 -Pseed=42 -PasOf=2025-06-30
 ```

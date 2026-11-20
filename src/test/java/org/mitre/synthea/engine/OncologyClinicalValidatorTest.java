@@ -8,7 +8,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.function.UnaryOperator;
 import org.junit.Test;
-import org.mitre.synthea.engine.OncologyScenario.Complexity;
 import org.mitre.synthea.engine.OncologyScenario.Event;
 import org.mitre.synthea.engine.OncologyScenario.Journey;
 import org.mitre.synthea.engine.OncologyScenario.Scenario;
@@ -18,23 +17,20 @@ public class OncologyClinicalValidatorTest {
 
   @Test
   public void seededCohortsMeetTheClinicalContract() {
-    for (int seed = 0; seed < 100; seed++) {
+    for (int seed = 0; seed < 300; seed++) {
       for (Scenario scenario : Scenario.values()) {
-        for (Complexity complexity : Complexity.values()) {
-          Journey journey = OncologyScenario.simulate(seed, seed % 13, SNAPSHOT,
-              scenario, complexity);
-          assertEquals(List.of(), OncologyClinicalValidator.validate(journey, journey.events()));
-          if (scenario == Scenario.TOXICITY) {
-            assertEquals(2, journey.events().stream().filter(e ->
-                e.kind().equals("medication") && e.value().equals("docetaxel")).count());
-          }
+        Journey journey = OncologyScenario.simulate(seed, seed % 13, SNAPSHOT, scenario);
+        assertEquals(List.of(), OncologyClinicalValidator.validate(journey, journey.events()));
+        if (scenario == Scenario.TOXICITY) {
+          assertEquals(2, journey.events().stream().filter(e ->
+              e.kind().equals("medication") && e.value().equals("docetaxel")).count());
         }
       }
     }
   }
 
   private Journey journey(Scenario scenario) {
-    return OncologyScenario.simulate(42, 0, SNAPSHOT, scenario, Complexity.COMPLEX);
+    return OncologyScenario.simulate(42, 0, SNAPSHOT, scenario);
   }
 
   private void rejects(Journey journey, String rule, UnaryOperator<List<Event>> mutate) {
@@ -138,7 +134,7 @@ public class OncologyClinicalValidatorTest {
   public void rejectsACompletedCourseWithMissingCycles() {
     Journey complete = java.util.stream.IntStream.range(0, 100)
         .mapToObj(seed -> OncologyScenario.simulate(seed, 0, SNAPSHOT,
-            Scenario.UNCOMPLICATED, Complexity.SIMPLE))
+            Scenario.UNCOMPLICATED))
         .filter(j -> j.events().stream().anyMatch(e -> e.key().equals("cycle-6-docetaxel")))
         .findFirst().orElseThrow();
     rejects(complete, "tchp-course-length", events -> {
@@ -159,7 +155,7 @@ public class OncologyClinicalValidatorTest {
           ? change(e, e.date(), "ypT0 ypN0 cM0") : e);
       return events;
     });
-    rejects(journey(Scenario.EQUIVOCAL_HER2), "equivocal-awaits-ish", events -> {
+    rejects(journey(Scenario.EQUIVOCAL_HER2), "equivocal-reflex-ish", events -> {
       events.removeIf(e -> e.key().equals("ish"));
       return events;
     });
@@ -226,20 +222,58 @@ public class OncologyClinicalValidatorTest {
   }
 
   @Test
-  public void displayComplexityPreservesTheClinicalCourse() {
-    for (Scenario scenario : Scenario.values()) {
-      List<String> simple = course(OncologyScenario.simulate(42, 0, SNAPSHOT,
-          scenario, Complexity.SIMPLE));
-      for (Complexity complexity : Complexity.values()) {
-        assertEquals(simple, course(OncologyScenario.simulate(42, 0, SNAPSHOT,
-            scenario, complexity)));
+  public void everyDocumentedTchpCycleRetainsItsMonitoring() {
+    for (Scenario scenario : List.of(Scenario.UNCOMPLICATED, Scenario.TOXICITY,
+        Scenario.DELAYED_RESTART)) {
+      for (int patient = 0; patient < 20; patient++) {
+        var events = OncologyScenario.simulate(42, patient, SNAPSHOT, scenario).events();
+        for (Event infusion : events) {
+          if (infusion.kind().equals("medication") && infusion.value().equals("docetaxel")) {
+            for (String measurement : List.of("ecog", "hemoglobin")) {
+              assertTrue(events.stream().anyMatch(e -> e.kind().equals(measurement)
+                  && e.date().equals(infusion.date()) && e.status().equals("final")));
+            }
+          }
+        }
       }
     }
   }
 
-  private List<String> course(Journey journey) {
-    return journey.events().stream().filter(e -> List.of("medication", "medication-order",
-        "procedure", "course", "stage").contains(e.kind())).map(e -> e.kind() + ":" + e.date()
-            + ":" + e.status() + ":" + e.value() + ":" + e.description()).toList();
+  @Test
+  public void reflexTestResultChangesTheEvidenceForTheBoard() {
+    var outcomes = new java.util.HashSet<String>();
+    for (int index = 0; index < 80; index++) {
+      Journey patient = OncologyScenario.simulate(42, index, SNAPSHOT, Scenario.EQUIVOCAL_HER2);
+      Event decision = patient.events().stream().filter(e -> e.key().equals("decision"))
+          .findFirst().orElseThrow();
+      Event evidence = patient.events().stream().filter(e -> e.key().equals(decision.cause()))
+          .findFirst().orElseThrow();
+      outcomes.add(evidence.kind().equals("molecular") ? evidence.status() : evidence.value());
+    }
+    assertEquals(java.util.Set.of("active", "Amplified", "Not amplified"), outcomes);
+  }
+
+  @Test
+  public void marginFindingsChangeTheCourseWithinOnePresentation() {
+    boolean clear = false;
+    boolean involved = false;
+    for (int index = 0; index < 80; index++) {
+      Journey patient = OncologyScenario.simulate(42, index, SNAPSHOT, Scenario.LOST_FOLLOWUP);
+      var events = patient.events();
+      Event margin = events.stream().filter(e -> e.key().equals("initial-margin"))
+          .findFirst().orElseThrow();
+      boolean reoperated = events.stream().anyMatch(e -> e.key().equals("re-excision"));
+      assertEquals(margin.value().equals("Involved"), reoperated);
+      if (reoperated) {
+        involved = true;
+        rejects(patient, "clear-final-margin", candidate -> {
+          candidate.removeIf(e -> e.key().equals("final-margin"));
+          return candidate;
+        });
+      } else {
+        clear = true;
+      }
+    }
+    assertTrue(clear && involved);
   }
 }

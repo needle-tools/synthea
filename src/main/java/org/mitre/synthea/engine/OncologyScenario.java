@@ -19,8 +19,6 @@ public final class OncologyScenario {
     LATE_LIVER_LESION, PULMONARY_RELAPSE, HEREDITARY_REVIEW, ER_LOW_REVIEW, DELAYED_RESTART
   }
 
-  public enum Complexity { SIMPLE, STANDARD, COMPLEX }
-
   public static final class Event {
     private final String key;
     private final String kind;
@@ -81,17 +79,15 @@ public final class OncologyScenario {
     private final long seed;
     private final int index;
     private final Scenario scenario;
-    private final Complexity complexity;
     private final LocalDate asOf;
     private final LocalDate birthDate;
     private final List<Event> events;
 
-    Journey(long seed, int index, Scenario scenario, Complexity complexity,
+    Journey(long seed, int index, Scenario scenario,
         LocalDate asOf, LocalDate birthDate, List<Event> events) {
       this.seed = seed;
       this.index = index;
       this.scenario = scenario;
-      this.complexity = complexity;
       this.asOf = asOf;
       this.birthDate = birthDate;
       this.events = events;
@@ -109,10 +105,6 @@ public final class OncologyScenario {
       return scenario;
     }
 
-    public Complexity complexity() {
-      return complexity;
-    }
-
     public LocalDate asOf() {
       return asOf;
     }
@@ -128,11 +120,19 @@ public final class OncologyScenario {
 
   private OncologyScenario() { }
 
-  /** Simulate an ordered journey, stopping at a clinically meaningful snapshot. */
-  public static Journey simulate(long seed, int index, LocalDate asOf, Scenario scenario,
-      Complexity complexity) {
-    if (index < 0 || asOf == null || scenario == null || complexity == null) {
-      throw new IllegalArgumentException("Index, snapshot, scenario and complexity are required");
+  /** Sample an independent patient. Ordinary follow-up is intentionally common in view tests. */
+  public static Journey simulate(long seed, int index, LocalDate asOf) {
+    var selection = new java.util.SplittableRandom(seed ^ (0x9e3779b97f4a7c15L * (index + 1)));
+    Scenario[] pathways = Scenario.values();
+    Scenario selected = selection.nextInt(4) == 0 ? Scenario.UNCOMPLICATED
+        : pathways[selection.nextInt(pathways.length)];
+    return simulate(seed, index, asOf, selected);
+  }
+
+  /** Generate a patient within an explicitly requested clinical situation. */
+  public static Journey simulate(long seed, int index, LocalDate asOf, Scenario scenario) {
+    if (index < 0 || asOf == null || scenario == null) {
+      throw new IllegalArgumentException("A nonnegative index, snapshot and scenario are required");
     }
     Random random = new Random(seed ^ (0x9e3779b97f4a7c15L * (index + 1)));
     switch (scenario) {
@@ -144,7 +144,7 @@ public final class OncologyScenario {
       case PULMONARY_RELAPSE:
       case HEREDITARY_REVIEW:
       case ER_LOW_REVIEW:
-        return new BreastBoardScenario(asOf, random).simulate(seed, index, scenario, complexity);
+        return new BreastBoardScenario(asOf, random).simulate(seed, index, scenario);
       default:
         break;
     }
@@ -166,34 +166,6 @@ public final class OncologyScenario {
     }
     LocalDate onset = asOf.minusDays(horizon);
     LocalDate biopsy = onset.plusDays(5);
-    add(events, "presentation", "assessment", onset, "completed",
-        "New breast finding; diagnostic assessment requested", null, null, null);
-    add(events, "menopause", "assessment", onset, "completed",
-        "Postmenopausal; natural menopause more than five years before presentation",
-        null, null, null);
-    if (complexity == Complexity.COMPLEX) {
-      add(events, "comorbidity", "problem", onset.minusDays(60), "active",
-          "Type 2 diabetes considered during treatment planning", null, null, null);
-    }
-    add(events, "breast-imaging", "imaging", onset.plusDays(2), "final",
-        "Suspicious left breast mass on mammography and ultrasound; axilla clinically negative",
-        null, null, null);
-    add(events, "biopsy", "specimen", biopsy, "available",
-        "Primary breast biopsy", "primary", null, null);
-    add(events, "pathology-order", "request", biopsy, "active",
-        "Histology and receptor assessment", "primary", null, null);
-    if (scenario == Scenario.AWAITING_PATHOLOGY) {
-      add(events, "pathology", "report", biopsy, "registered",
-          "Histology requested; report not yet available", "primary", null, "pathology-order");
-      add(events, "review-pathology", "task", asOf, "on-hold",
-          "Obtain pathology before treatment planning", null, null, "pathology-order");
-      return journey(seed, index, asOf, scenario, complexity, random, events);
-    }
-    LocalDate diagnosis = biopsy.plusDays(4 + random.nextInt(5));
-    add(events, "diagnosis", "condition", diagnosis, "active",
-        "Malignant neoplasm of breast", null, null, null);
-    add(events, "pathology", "report", diagnosis, "final",
-        "Invasive breast carcinoma; primary specimen", "primary", null, "pathology-order");
     // Two explicit treatment archetypes. Receptor status is never sampled independently of care.
     boolean restarting = scenario == Scenario.DELAYED_RESTART;
     boolean her2Positive = scenario == Scenario.TOXICITY || restarting
@@ -201,6 +173,41 @@ public final class OncologyScenario {
         || (!relapsed && scenario != Scenario.DELAYED_MOLECULAR
             && scenario != Scenario.LOST_FOLLOWUP && random.nextBoolean());
     boolean erPositive = !her2Positive;
+    boolean t2 = her2Positive || discordant || scenario == Scenario.DELAYED_MOLECULAR;
+    int lesionSize = t2 ? 22 + random.nextInt(23) : 12 + random.nextInt(8);
+    String breast = random.nextBoolean() ? "left" : "right";
+    String site = breast + " breast at " + (1 + random.nextInt(12)) + " o'clock";
+    add(events, "presentation", "assessment", onset, "completed",
+        random.nextBoolean() ? "Recalled after abnormal screening mammogram"
+            : "Patient noticed a new palpable breast lump and sought assessment", null, null, null);
+    add(events, "menopause", "assessment", onset, "completed",
+        "Postmenopausal; natural menopause more than five years before presentation",
+        null, null, null);
+    boolean diabetes = random.nextInt(5) == 0;
+    if (diabetes) {
+      add(events, "comorbidity", "problem", onset.minusDays(60), "active",
+          "Type 2 diabetes considered during treatment planning", null, null, null);
+    }
+    add(events, "breast-imaging", "imaging", onset.plusDays(2), "final",
+        "Suspicious " + lesionSize + " mm mass in the " + site
+            + " on mammography and ultrasound; axilla clinically negative",
+        null, null, null);
+    add(events, "biopsy", "specimen", biopsy, "available",
+        "Core biopsy of suspicious breast lesion", "primary", site, null);
+    add(events, "pathology-order", "request", biopsy, "active",
+        "Histology and receptor assessment", "primary", null, null);
+    if (scenario == Scenario.AWAITING_PATHOLOGY) {
+      add(events, "pathology", "report", biopsy, "registered",
+          "Histology requested; report not yet available", "primary", null, "pathology-order");
+      add(events, "review-pathology", "task", asOf, "on-hold",
+          "Obtain pathology before treatment planning", null, null, "pathology-order");
+      return journey(seed, index, asOf, scenario, random, events);
+    }
+    LocalDate diagnosis = biopsy.plusDays(4 + random.nextInt(5));
+    add(events, "diagnosis", "condition", diagnosis, "active",
+        "Malignant neoplasm of breast", null, null, null);
+    add(events, "pathology", "report", diagnosis, "final",
+        "Invasive breast carcinoma; primary specimen", "primary", null, "pathology-order");
     String her2 = her2Positive ? "IHC 3+" : "IHC 1+";
     markers(events, "primary", diagnosis, erPositive, her2);
     add(events, "primary-histology", "histology", diagnosis, "final", "histology_type",
@@ -209,8 +216,7 @@ public final class OncologyScenario {
         "primary", her2Positive || discordant ? "G3" : "G2", null);
     add(events, "stage", "stage", diagnosis.plusDays(3), "final",
         "Clinical TNM assessment", null,
-        her2Positive || discordant || scenario == Scenario.DELAYED_MOLECULAR
-            ? "cT2 cN0 cM0" : "cT1c cN0 cM0", null);
+        t2 ? "cT2 cN0 cM0" : "cT1c cN0 cM0", null);
     add(events, "ecog-baseline", "ecog", diagnosis, "final",
         "ECOG performance status", null, Integer.toString(random.nextInt(2)), null);
     add(events, "staging-imaging", her2Positive ? "imaging" : "assessment",
@@ -232,7 +238,7 @@ public final class OncologyScenario {
       add(events, "preference-review", "task", asOf, "requested",
           "Arrange another discussion of preferences and supportive care",
           null, null, "therapy-order");
-      return journey(seed, index, asOf, scenario, complexity, random, events);
+      return journey(seed, index, asOf, scenario, random, events);
     }
     LocalDate treatment = diagnosis.plusDays(21);
     int cycles = 6;
@@ -273,9 +279,10 @@ public final class OncologyScenario {
                 + " premedication, antiemetics and growth-factor prophylaxis arranged",
             null, null, "therapy-order");
         add(events, "anc-" + cycle, "anc", day.minusDays(1), "final",
-            "Absolute neutrophil count", null, "3.2", null);
+            "Absolute neutrophil count", null,
+            Double.toString((20 + random.nextInt(36)) / 10.0), null);
         add(events, "platelets-" + cycle, "platelets", day.minusDays(1), "final",
-            "Platelet count", null, "240", null);
+            "Platelet count", null, Integer.toString(150 + random.nextInt(151)), null);
         for (String drug : List.of("docetaxel", "carboplatin", "trastuzumab", "pertuzumab")) {
           add(events, "cycle-" + (cycle + 1) + "-" + drug, "medication", day, "completed",
               "TCHP cycle " + (cycle + 1), null, drug, "order-" + drug);
@@ -284,19 +291,17 @@ public final class OncologyScenario {
           add(events, "lvef-cycle-4", "lvef", day.minusDays(2), "final",
               "Left ventricular ejection fraction", null, "61", null);
         }
-        if (complexity != Complexity.SIMPLE) {
-          add(events, "ecog-cycle-" + cycle, "ecog", day, "final",
-              "ECOG performance status", null, cycle < 2 ? "0" : "1", null);
-          add(events, "hemoglobin-cycle-" + cycle, "hemoglobin", day, "final",
-              "Hemoglobin", null, Double.toString((132 - cycle * 4) / 10.0), null);
-        }
+        add(events, "ecog-cycle-" + cycle, "ecog", day, "final",
+            "ECOG performance status", null, cycle < 2 ? "0" : "1", null);
+        add(events, "hemoglobin-cycle-" + cycle, "hemoglobin", day, "final",
+            "Hemoglobin", null, Double.toString((132 - cycle * 4) / 10.0), null);
       }
     }
     if (restarting) {
       add(events, "restart-review", "task", asOf, "requested",
           "Review tolerance of the reloading infusions and coordinate cycle four",
           null, "PHYSICIAN", "cycle-3-pertuzumab");
-      return journey(seed, index, asOf, scenario, complexity, random, events);
+      return journey(seed, index, asOf, scenario, random, events);
     }
     if (scenario == Scenario.TOXICITY) {
       LocalDate interruption = treatment.plusDays(30);
@@ -309,23 +314,28 @@ public final class OncologyScenario {
           "Review toxicity and treatment continuation before next cycle", null, null, "toxicity");
       add(events, "ecog-current", "ecog", asOf, "final",
           "ECOG performance status", null, "2", null);
-      return journey(seed, index, asOf, scenario, complexity, random, events);
+      return journey(seed, index, asOf, scenario, random, events);
     }
     LocalDate surgery = her2Positive ? treatment.plusDays((cycles - 1) * 21L + 28)
         : diagnosis.plusDays(21);
     add(events, "surgery", "procedure", surgery, "completed",
-        "Left breast-conserving surgery with sentinel lymph node biopsy",
+        "Breast-conserving surgery with sentinel node biopsy, " + breast + " breast",
         null, null, "board-initial");
     add(events, "surgical-sample", "specimen", surgery, "available",
-        "Surgical breast specimen", "surgical", null, null);
+        "Surgical breast specimen", "surgical", breast + " breast", null);
+    boolean involvedMargin = (scenario == Scenario.LOST_FOLLOWUP || scenario == Scenario.RECURRENCE
+        || (scenario == Scenario.PARTIAL_DATES && erPositive)) && random.nextBoolean();
+    String margin = involvedMargin ? "invasive carcinoma at inked lateral radial margin"
+        : "negative margins";
     add(events, "surgical-pathology", "report", surgery.plusDays(7), "final",
         her2Positive ? "No residual invasive or in situ carcinoma;"
             + " negative margins; 0/3 sentinel nodes"
-            : discordant ? "32 mm invasive NST, G3; clear margins; 2/3 positive sentinel nodes"
-            : scenario == Scenario.DELAYED_MOLECULAR
-                ? "28 mm invasive carcinoma NST, G2; negative margins; 0/3 sentinel nodes"
-                : "18 mm invasive carcinoma NST, G2; negative margins; 0/3 sentinel nodes",
+            : (lesionSize + random.nextInt(3) - 1) + " mm invasive carcinoma NST, "
+                + (discordant ? "G3; clear margins; 2/3 positive sentinel nodes"
+                    : "G2; " + margin + "; 0/3 sentinel nodes"),
         "surgical", null, null);
+    add(events, "initial-margin", "histology", surgery.plusDays(7), "final",
+        "Radial resection margin", "surgical", involvedMargin ? "Involved" : "Clear", null);
     add(events, "stage-surgery", "stage", surgery.plusDays(7), "final",
         "Postoperative pathological TNM", "surgical", her2Positive ? "ypT0 ypN0 cM0"
             : discordant ? "pT2 pN1a(sn) cM0"
@@ -342,17 +352,35 @@ public final class OncologyScenario {
           "Adjuvant chemotherapy decision pending;"
               + " endocrine therapy and breast radiotherapy planned",
           null, null, "molecular-order");
-      return journey(seed, index, asOf, scenario, complexity, random, events);
+      return journey(seed, index, asOf, scenario, random, events);
     }
-    add(events, "board-postop", "board", surgery.plusDays(14), "completed",
+    LocalDate definitiveSurgery = surgery;
+    String definitivePathology = "surgical-pathology";
+    if (involvedMargin) {
+      definitiveSurgery = surgery.plusDays(17 + random.nextInt(8));
+      add(events, "margin-review", "board", surgery.plusDays(10), "completed",
+          "Discussed involved lateral margin; patient elected re-excision",
+          null, null, "surgical-pathology");
+      add(events, "re-excision", "procedure", definitiveSurgery, "completed",
+          "Re-excision of lateral cavity margin, " + breast + " breast", null, null, "margin-review");
+      add(events, "margin-sample", "specimen", definitiveSurgery, "available",
+          "Oriented lateral margin re-excision specimen", "margin", breast + " breast", "re-excision");
+      definitivePathology = "margin-pathology";
+      add(events, definitivePathology, "report", definitiveSurgery.plusDays(5), "final",
+          "No residual carcinoma in the re-excised lateral margin; final margins clear",
+          "margin", null, null);
+      add(events, "final-margin", "histology", definitiveSurgery.plusDays(5), "final",
+          "Radial resection margin", "margin", "Clear", null);
+    }
+    add(events, "board-postop", "board", definitiveSurgery.plusDays(14), "completed",
         her2Positive ? "Pathological complete response; continue trastuzumab to one year total;"
             + " adjuvant breast radiotherapy"
             : discordant ? "Node-positive high-grade disease: adjuvant EC then weekly paclitaxel,"
                 + " breast and regional nodal irradiation, followed by letrozole"
             : "Low clinical recurrence risk: no chemotherapy; adjuvant letrozole for five years"
             + " and breast radiotherapy; bone health assessment and antiresorptive discussion",
-        null, null, "surgical-pathology");
-    LocalDate radiation = surgery.plusDays(discordant ? 214 : 35);
+        null, null, definitivePathology);
+    LocalDate radiation = definitiveSurgery.plusDays(discordant ? 214 : 35);
     if (discordant) {
       add(events, "adjuvant-echo", "lvef", surgery.plusDays(23), "final",
           "LVEF before anthracycline treatment", null, "64", null);
@@ -363,14 +391,14 @@ public final class OncologyScenario {
           "Twelve weekly doses of paclitaxel", null, surgery.plusDays(189).toString(),
           "adjuvant-ec");
     }
-    String field = discordant ? "left breast and regional nodal" : "left whole-breast";
+    String field = breast + (discordant ? " breast and regional nodal" : " whole-breast");
     add(events, "radiotherapy-start", "assessment", radiation, "completed",
         "Adjuvant " + field + " radiotherapy commenced with cardiac-sparing technique",
         null, null, "board-postop");
     add(events, "radiotherapy", "procedure", radiation.plusDays(21), "completed",
         "Adjuvant " + field + " radiotherapy course completed", null, null, "board-postop");
     if (erPositive) {
-      LocalDate endocrine = discordant ? radiation.plusDays(22) : surgery.plusDays(21);
+      LocalDate endocrine = discordant ? radiation.plusDays(22) : definitiveSurgery.plusDays(21);
       add(events, "endocrine-order", "medication-order", endocrine,
           relapsed ? "stopped" : "active",
           "Adjuvant endocrine therapy; planned duration five years",
@@ -392,8 +420,8 @@ public final class OncologyScenario {
             "Left ventricular ejection fraction", null, "60", null);
       }
     }
-    if (complexity == Complexity.COMPLEX) {
-      add(events, "supportive-review", "task", surgery.plusDays(15), "completed",
+    if (diabetes) {
+      add(events, "supportive-review", "task", definitiveSurgery.plusDays(15), "completed",
           "Supportive care and comorbidity review documented", null, null, "board-postop");
     }
     if (relapsed) {
@@ -437,7 +465,7 @@ public final class OncologyScenario {
                   + " endocrine adherence unknown"
               : "Arrange follow-up assessment", null, null, "board-postop");
     }
-    return journey(seed, index, asOf, scenario, complexity, random, events);
+    return journey(seed, index, asOf, scenario, random, events);
   }
 
   private static void markers(List<Event> events, String sample, LocalDate date,
@@ -461,25 +489,7 @@ public final class OncologyScenario {
   }
 
   private static Journey journey(long seed, int index, LocalDate asOf, Scenario scenario,
-      Complexity complexity, Random random, List<Event> events) {
-    Event outstanding = events.stream().filter(e -> e.kind().equals("task")
-        && !e.status().equals("completed")).reduce((first, last) -> last).orElseThrow();
-    if (complexity != Complexity.SIMPLE) {
-      add(events, "board-brief", "task", asOf, "requested",
-          "Prepare the board update: " + outstanding.description(), null, "ODOK",
-          outstanding.key());
-    }
-    if (complexity == Complexity.COMPLEX) {
-      add(events, "source-check", "investigation", asOf, "active",
-          "Request the referring service's original breast imaging for comparison",
-          null, null, null);
-      add(events, "image-review", "task", asOf, "requested",
-          "Reconcile external mammography with the local assessment", null, "PHYSICIAN",
-          "source-check");
-      add(events, "handoff", "task", asOf, "on-hold",
-          "Confirm follow-up board slot after comparative imaging review", null, "CASE_MANAGER",
-          "image-review");
-    }
+      Random random, List<Event> events) {
     if (events.stream().anyMatch(e -> e.key().equals("surgical-pathology"))
         && events.stream().noneMatch(e -> e.key().equals("metastasis"))) {
       events.replaceAll(e -> e.key().equals("diagnosis")
@@ -487,7 +497,7 @@ public final class OncologyScenario {
               e.sample(), e.value(), e.cause()) : e);
     }
     events.sort(java.util.Comparator.comparing(Event::date));
-    Journey result = new Journey(seed, index, scenario, complexity, asOf,
+    Journey result = new Journey(seed, index, scenario, asOf,
         asOf.minusYears(60 + random.nextInt(16)).minusDays(random.nextInt(365)),
         Collections.unmodifiableList(events));
     OncologyClinicalValidator.requireValid(result);

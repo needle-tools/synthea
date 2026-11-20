@@ -124,6 +124,14 @@ public final class OncologyClinicalValidator {
     }
     if (byKey.containsKey("surgery")) {
       before(byKey, "surgery", "surgical-pathology", "surgical-pathology-order", issues);
+      if (value(byKey, "initial-margin", "Involved")) {
+        before(byKey, "surgical-pathology", "re-excision", "involved-margin-review", issues);
+        before(byKey, "re-excision", "margin-pathology", "definitive-margin-report", issues);
+        before(byKey, "margin-pathology", "board-postop", "definitive-margin-review", issues);
+        before(byKey, "board-postop", "radiotherapy-start", "definitive-margin-review", issues);
+        check(value(byKey, "final-margin", "Clear")
+            && "margin".equals(byKey.get("final-margin").sample()), "clear-final-margin", issues);
+      }
       check(byKey.containsKey("stage-surgery"), "pathological-stage", issues);
       check(byKey.containsKey("diagnosis") && byKey.get("diagnosis").status().equals(
           byKey.containsKey("metastasis") ? "active" : "remission"), "disease-status", issues);
@@ -191,12 +199,17 @@ public final class OncologyClinicalValidator {
         requiredEvidence = "er-review";
         break;
       case EQUIVOCAL_HER2:
-        check(value(events, "primary-her2", "IHC 2+") && pending(events, "ish")
+        Event order = events.get("ish");
+        Event addendum = events.get("ish-result");
+        check(value(events, "primary-her2", "IHC 2+") && order != null
+            && "primary".equals(order.sample())
+            && (addendum == null ? pending(events, "ish")
+                : order.status().equals("completed") && addendum.status().equals("final")
+                    && "primary".equals(addendum.sample()) && "ish".equals(addendum.cause())
+                    && Set.of("Amplified", "Not amplified").contains(addendum.value()))
             && events.values().stream().noneMatch(e -> Set.of("course", "medication",
-                "medication-order").contains(e.kind())
-                || e.kind().equals("her2") && !e.key().equals("primary-her2")),
-            "equivocal-awaits-ish", issues);
-        requiredEvidence = "ish";
+                "medication-order").contains(e.kind())), "equivocal-reflex-ish", issues);
+        requiredEvidence = addendum == null ? "ish" : "ish-result";
         break;
       case RESIDUAL_TNBC:
       case HEREDITARY_REVIEW:

@@ -4,7 +4,6 @@ import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
-import org.mitre.synthea.engine.OncologyScenario.Complexity;
 import org.mitre.synthea.engine.OncologyScenario.Event;
 import org.mitre.synthea.engine.OncologyScenario.Journey;
 import org.mitre.synthea.engine.OncologyScenario.Scenario;
@@ -42,7 +41,7 @@ final class BreastBoardScenario {
     }
   }
 
-  Journey simulate(long seed, int index, Scenario scenario, Complexity depth) {
+  Journey simulate(long seed, int index, Scenario scenario) {
     boolean young = scenario == Scenario.HEREDITARY_REVIEW || scenario == Scenario.RESIDUAL_TNBC;
     final int age = young ? 34 + random.nextInt(8) : 60 + random.nextInt(13);
     int days = daysFromPresentation(scenario);
@@ -94,10 +93,24 @@ final class BreastBoardScenario {
         evidence = "er-review";
         break;
       case EQUIVOCAL_HER2:
-        put("ish", "molecular", 7, "active", "Reflex HER2 ISH on equivocal core biopsy",
-            "primary", null, null);
-        question = "Review the ISH addendum before assigning HER2 status and choosing therapy";
-        evidence = "ish";
+        boolean resulted = random.nextBoolean();
+        put("ish", "molecular", 7, resulted ? "completed" : "active",
+            "Reflex HER2 ISH on equivocal core biopsy", "primary", null, null);
+        if (resulted) {
+          boolean amplified = random.nextBoolean();
+          String finding = amplified ? "Amplified" : "Not amplified";
+          put("ish-result", "molecular-report", 1, "final",
+              "Dual-probe ISH: " + finding + (amplified
+                  ? "; HER2/CEP17 ratio 3.1, mean HER2 signals per cell 6.2"
+                  : "; HER2/CEP17 ratio 1.2, mean HER2 signals per cell 2.4"),
+              "primary", finding, "ish");
+          question = amplified ? "Review HER2-positive disease and systemic therapy sequencing"
+              : "Plan surgery for ER-positive, HER2-negative disease";
+          evidence = "ish-result";
+        } else {
+          question = "Review the ISH addendum before assigning HER2 status and choosing therapy";
+          evidence = "ish";
+        }
         break;
       case LATE_LIVER_LESION:
         breastSurgery(days - 35, "18 mm NST, negative margins, 0/3 sentinel nodes", "pT1c pN0(sn)");
@@ -144,11 +157,14 @@ final class BreastBoardScenario {
         }
         boolean residual = scenario == Scenario.RESIDUAL_TNBC || scenario == Scenario.RESIDUAL_HER2;
         int op = days - (tnbc ? 190 : 160);
+        int residualSize = residual ? 21 + random.nextInt(9) : 0;
         put("response", "imaging", op + 9, "final", residual
-            ? "Preoperative ultrasound shows partial response, residual mass 25 mm"
+            ? "Preoperative ultrasound shows partial response, residual mass " + residualSize + " mm"
             : "Preoperative ultrasound shows no measurable breast mass", null, null, null);
         breastSurgery(op, residual
-            ? "Residual invasive carcinoma 24 mm, margins clear, 1/10 positive nodes"
+            ? "Residual invasive carcinoma " + residualSize + " mm, margins clear, "
+                + (1 + random.nextInt(3)) + "/" + (10 + random.nextInt(6))
+                + " nodes with macrometastasis"
             : "Complete pathological response, margins clear, clipped node negative",
             residual ? "ypT2 ypN1a" : "ypT0 ypN0");
         if (residual) {
@@ -174,7 +190,8 @@ final class BreastBoardScenario {
             course("continuation", op - 20, op - 190, "Adjuvant pembrolizumab completed");
             put("counselling", "assessment", 18, "completed",
                 "Testing was missed during initial external treatment. Patient reports maternal"
-                    + " breast cancer around age 43; genetic counselling and consent documented",
+                    + " breast cancer around age " + (38 + random.nextInt(10))
+                    + "; genetic counselling and consent documented",
                 null, null, null);
             tissue("blood", "germline", 14, "Peripheral blood");
             put("panel", "molecular", 14, "active", "Germline hereditary breast cancer panel",
@@ -204,12 +221,13 @@ final class BreastBoardScenario {
     }
     put("next-board", "board", 0, "draft", question, null, null, evidence);
     task("decision", 0, "PHYSICIAN", question, evidence);
-    if (depth != Complexity.SIMPLE) {
+    if (events.stream().anyMatch(e -> e.key().equals(evidence)
+        && e.status().equals("active"))) {
       task("track", 0, "CASE_MANAGER", "Coordinate evidence review with the responsible physician",
           evidence);
     }
-    if (depth == Complexity.COMPLEX) {
-      String additionalWork = outstandingEvidence(scenario);
+    String additionalWork = outstandingEvidence(scenario);
+    if (additionalWork != null) {
       put("source-query", "investigation", 0, "active", additionalWork, null, null, null);
       task("reconcile", 0, "ODOK", "Track the outstanding evidence: " + additionalWork,
           "source-query");
@@ -224,7 +242,7 @@ final class BreastBoardScenario {
         + ", HER2 " + her2 + ", Ki-67 " + ki67 + "%. " + question + ".";
     put("board-summary", "assessment", 0, "completed", summary, null, null, evidence);
     events.sort(java.util.Comparator.comparing(Event::date));
-    Journey result = new Journey(seed, index, scenario, depth, snapshot,
+    Journey result = new Journey(seed, index, scenario, snapshot,
         snapshot.minusDays(days).minusYears(age).minusDays(random.nextInt(365)),
         List.copyOf(events));
     OncologyClinicalValidator.requireValid(result);
@@ -237,18 +255,10 @@ final class BreastBoardScenario {
         return "Verify the reported age at diagnosis of the affected first-degree relative";
       case LATE_LIVER_LESION:
         return "Obtain older abdominal imaging to compare the indeterminate liver lesion";
-      case PULMONARY_RELAPSE:
-      case NODE_POSITIVE_TCHP:
-      case RESIDUAL_HER2:
-        return "Obtain updated cardiac function assessment for the next HER2 therapy review";
-      case RESIDUAL_TNBC:
-        return "Obtain residual tumor bed dimensions and cellularity from surgical pathology";
-      case EQUIVOCAL_HER2:
-        return "Confirm tissue adequacy with the reference laboratory for the ISH addendum";
       case ER_LOW_REVIEW:
         return "Retrieve the original stained slides and control images for joint review";
       default:
-        throw new IllegalArgumentException(scenario.name());
+        return null;
     }
   }
 
